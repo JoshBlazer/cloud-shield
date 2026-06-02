@@ -17,7 +17,8 @@ Globals:
         VIOLATIONS_TABLE:        !Ref ViolationsTable
         AUDIT_LOG_TABLE:         !Ref AuditLogTable
         DASHBOARD_URL:           !Sub "https://${DashboardDistribution.DomainName}"
-        SLACK_WEBHOOK_URL:       !Ref SlackWebhookUrl
+        # Secrets are fetched from Secrets Manager at cold start, NOT injected here.
+        SECRETS_ARN:             !Ref CloudShieldSecrets
 
 Parameters:
   SlackWebhookUrl:
@@ -116,13 +117,21 @@ Resources:
         - { Key: Environment, Value: !Ref Environment }
 
   # -------------------------------------------------------------------------
-  # Secrets Manager — store API keys off Lambda env vars
+  # Secrets Manager — single source of truth for runtime secrets.
+  # Lambdas read these at cold start (src/config/secrets.py); the values are
+  # never placed in Lambda environment variables.
+  #
+  # The NoEcho parameters below are only a deploy-time BOOTSTRAP — they seed the
+  # secret on first create. To rotate afterward, update the secret directly
+  # (`aws secretsmanager put-secret-value --secret-id /cloudshield/<env>/secrets ...`)
+  # without redeploying; leave the params empty on subsequent deploys to avoid
+  # overwriting a rotated value.
   # -------------------------------------------------------------------------
   CloudShieldSecrets:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub "/cloudshield/${Environment}/secrets"
-      Description: "CloudShield webhook URLs and API keys"
+      Description: "CloudShield webhook URLs and API keys (read at runtime, not via env)"
       SecretString: !Sub |
         {
           "slack_webhook_url":    "${SlackWebhookUrl}",
@@ -350,8 +359,8 @@ Resources:
       Description: "REST API for the CloudShield dashboard"
       Environment:
         Variables:
-          API_KEY:               !Ref ApiKey
-          SLACK_SIGNING_SECRET:  !Ref SlackSigningSecret
+          # API key + Slack signing secret come from Secrets Manager (SECRETS_ARN
+          # is set in Globals). Only non-secret config lives in env vars.
           AUDITOR_FUNCTION_NAME: !Sub "cloudshield-auditor-${Environment}"
           COGNITO_ISSUER:        !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
           COGNITO_CLIENT_ID:     !Ref UserPoolClient

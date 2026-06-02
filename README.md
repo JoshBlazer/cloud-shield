@@ -124,10 +124,12 @@ Lifecycle transitions are available via the dashboard UI, Slack buttons, or `PAT
 
 Two layers, picked per caller:
 
-- **Dashboard users** sign in through a Cognito hosted UI (OAuth2 + PKCE, no client secret). The SPA holds the resulting JWT in memory only (never localStorage) and sends it as `Authorization: Bearer <jwt>`. The API validates the token against the Cognito JWKS at the Lambda layer. This solves the "static SPA can't hold a secret" problem — there's no long-lived key in the bundle.
+- **Dashboard users** sign in through a Cognito hosted UI (OAuth2 + PKCE, no client secret). The SPA holds the resulting token in memory only (never localStorage) and sends it as `Authorization: Bearer <jwt>`. The API validates the signature against the Cognito JWKS, checks the `iss` claim equals the expected issuer, and confirms the client by `token_use`: ID tokens must have `aud == client_id`, access tokens must have `client_id == client_id` (Cognito access tokens carry no `aud`). This solves the "static SPA can't hold a secret" problem — there's no long-lived key in the bundle.
 - **Machine-to-machine** callers (CI, scripts) send `X-Api-Key: <key>`, checked in constant time.
 
-When neither `ApiKey` nor `COGNITO_ISSUER` is set (local dev), auth passes through. Secrets (`SlackWebhookUrl`, `ApiKey`, `SlackSigningSecret`) are stored in AWS Secrets Manager, not plain Lambda env vars.
+When neither an API key nor `COGNITO_ISSUER` is configured (local dev), auth passes through.
+
+**Secrets.** The Slack webhook, API key, and Slack signing secret live in AWS Secrets Manager and are fetched at Lambda cold start (`src/config/secrets.py`), cached for the container's life. They are never placed in Lambda environment variables, so they don't appear in the function configuration. The `NoEcho` CloudFormation parameters only seed the secret on first deploy — rotate later with `aws secretsmanager put-secret-value` and leave the params empty on subsequent deploys.
 
 ## Multi-account, multi-region
 
@@ -170,12 +172,13 @@ src/
   auditors/       base_auditor.py + s3/ec2/iam auditors
   engine/         evaluator.py — multi-account/region orchestration
   store/          violations.py (CRUD + lifecycle), audit_log.py (transition trail)
+  config/         secrets.py — Secrets Manager loader (cold-start, cached)
   notifications/  slack.py + digest.py
   api/            handler.py — API Gateway Lambda (API key + Cognito JWT auth)
   handler.py      main Lambda entrypoint (scheduled auditor)
 dashboard/        React + Vite + TypeScript + Tailwind + Recharts
   src/hooks/      useAuth.ts — Cognito PKCE flow
-tests/            81 tests (moto-based, no real AWS needed)
+tests/            88 tests (moto-based, no real AWS needed)
 policies.yaml         declarative rule definitions
 template.yaml         SAM IaC (DynamoDB, Lambda, API GW, CloudFront, Cognito, SQS, Secrets)
 member-account-role.yaml  read-only role to deploy in each scanned account

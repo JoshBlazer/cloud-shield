@@ -6,10 +6,12 @@ from typing import Any
 import requests
 import structlog
 
+from src.config import secrets
+
 log = structlog.get_logger()
 
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
-DASHBOARD_URL     = os.environ.get("DASHBOARD_URL", "https://cloudshield.example.com")
+# DASHBOARD_URL is a public link, not a secret — stays in env.
+DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://cloudshield.example.com")
 
 _EMOJI = {
     "CRITICAL": ":red_circle:",
@@ -78,11 +80,12 @@ def _blocks_for_violation(v: dict[str, Any]) -> list[dict]:
 
 
 def _post(payload: dict) -> None:
-    if not SLACK_WEBHOOK_URL:
+    webhook = secrets.get_secret("slack_webhook_url")
+    if not webhook:
         log.warning("slack.webhook_not_configured")
         return
     try:
-        resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
+        resp = requests.post(webhook, json=payload, timeout=5)
         resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001
         log.error("slack.post_failed", error=str(exc))

@@ -11,13 +11,14 @@ from typing import Any
 import boto3
 import structlog
 
+from src.config import secrets
 from src.store import audit_log
 from src.store import violations as store
 
 log = structlog.get_logger()
 
-_API_KEY           = os.environ.get("API_KEY", "")
-_SLACK_SIGNING_SEC = os.environ.get("SLACK_SIGNING_SECRET", "")
+# Secrets (api_key, slack_signing_secret) come from Secrets Manager via the
+# secrets module — never from Lambda env vars. Non-secret config stays in env.
 _AUDITOR_FUNCTION  = os.environ.get("AUDITOR_FUNCTION_NAME", "")
 _COGNITO_ISSUER    = os.environ.get("COGNITO_ISSUER", "")
 _COGNITO_CLIENT_ID = os.environ.get("COGNITO_CLIENT_ID", "")
@@ -67,18 +68,33 @@ def _verify_jwt(token: str) -> bool:
     try:
         from jose import jwt as jose_jwt
         jwks = _load_jwks()
-        jose_jwt.decode(token, jwks, algorithms=["RS256"], audience=_COGNITO_CLIENT_ID)
-        return True
+        # Validate signature + issuer here. Cognito ACCESS tokens have no `aud`
+        # claim (they carry `client_id`), so audience is checked per token_use
+        # below rather than via jose's audience= (which assumes an `aud` claim).
+        claims = jose_jwt.decode(
+            token, jwks,
+            algorithms=["RS256"],
+            issuer=_COGNITO_ISSUER,
+            options={"verify_aud": False},
+        )
+        token_use = claims.get("token_use")
+        if token_use == "id":
+            return claims.get("aud") == _COGNITO_CLIENT_ID
+        if token_use == "access":
+            return claims.get("client_id") == _COGNITO_CLIENT_ID
+        return False
     except Exception:  # noqa: BLE001
         return False
 
 
 def _is_authorized(headers: dict[str, str]) -> bool:
     """Accept API key (machine-to-machine) OR Cognito JWT Bearer token (dashboard)."""
+    api_key = secrets.get_secret("api_key")
+
     # API key — constant-time to prevent timing oracle
-    if _API_KEY:
+    if api_key:
         provided = headers.get("x-api-key", "")
-        if provided and hmac.compare_digest(provided, _API_KEY):
+        if provided and hmac.compare_digest(provided, api_key):
             return True
 
     # Cognito JWT Bearer
@@ -86,12 +102,13 @@ def _is_authorized(headers: dict[str, str]) -> bool:
     if auth.startswith("Bearer ") and _verify_jwt(auth[7:]):
         return True
 
-    # Neither API key nor JWT configured → dev/local mode, pass through
-    return not (_API_KEY or _COGNITO_ISSUER)
+    # Neither API key nor Cognito configured → dev/local mode, pass through
+    return not (api_key or _COGNITO_ISSUER)
 
 
 def _verify_slack_signature(event: dict, headers: dict[str, str]) -> bool:
-    if not _SLACK_SIGNING_SEC:
+    signing_secret = secrets.get_secret("slack_signing_secret")
+    if not signing_secret:
         return True
     timestamp  = headers.get("x-slack-request-timestamp", "")
     sig_header = headers.get("x-slack-signature", "")
@@ -104,7 +121,7 @@ def _verify_slack_signature(event: dict, headers: dict[str, str]) -> bool:
         return False
     body     = event.get("body", "") or ""
     sig_base = f"v0:{timestamp}:{body}"
-    mac      = hmac.new(_SLACK_SIGNING_SEC.encode(), sig_base.encode(), hashlib.sha256)
+    mac      = hmac.new(signing_secret.encode(), sig_base.encode(), hashlib.sha256)
     return hmac.compare_digest("v0=" + mac.hexdigest(), sig_header)
 
 
