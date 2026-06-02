@@ -5,7 +5,7 @@
  */
 import type { AuditTriggerResult, Summary, Violation } from '../types'
 
-const NOW = new Date().toISOString()
+const NOW      = new Date().toISOString()
 const HOUR_AGO = new Date(Date.now() - 3_600_000).toISOString()
 const DAY_AGO  = new Date(Date.now() - 86_400_000).toISOString()
 
@@ -96,19 +96,19 @@ export const MOCK_VIOLATIONS: Violation[] = [
   },
 ]
 
+// total = 4+1+1+6+2 = 14; RESOLVED (6) < total (14) → score = 43%
 export const MOCK_SUMMARY: Summary = {
-  total: 7,
-  by_status:   { OPEN: 4, ACKNOWLEDGED: 1, SNOOZED: 1, RESOLVED: 8 },
+  total: 14,
+  by_status:   { OPEN: 4, ACKNOWLEDGED: 1, SNOOZED: 1, RESOLVED: 6, EXEMPTED: 2 },
   by_severity: { CRITICAL: 4, HIGH: 2, MEDIUM: 1, LOW: 0 },
   by_team: {
-    'data-platform': { OPEN: 2, ACKNOWLEDGED: 0, RESOLVED: 3 },
-    'backend':       { OPEN: 1, ACKNOWLEDGED: 1, RESOLVED: 2 },
-    'infra':         { OPEN: 2, ACKNOWLEDGED: 0, RESOLVED: 1 },
-    'platform':      { OPEN: 0, ACKNOWLEDGED: 0, RESOLVED: 2 },
+    'data-platform': { OPEN: 2, ACKNOWLEDGED: 0, SNOOZED: 0, RESOLVED: 3 },
+    'backend':       { OPEN: 1, ACKNOWLEDGED: 1, SNOOZED: 0, RESOLVED: 2 },
+    'infra':         { OPEN: 2, ACKNOWLEDGED: 0, SNOOZED: 0, RESOLVED: 2 },
+    'platform':      { OPEN: 0, ACKNOWLEDGED: 0, SNOOZED: 1, RESOLVED: 0 },
   },
 }
 
-// Simulates 7 days of hourly audit data for the trend chart
 export const MOCK_TREND = Array.from({ length: 7 }, (_, i) => ({
   day: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][i],
   CRITICAL: [6, 7, 5, 8, 6, 4, 4][i],
@@ -120,7 +120,6 @@ function delay<T>(val: T, ms = 300): Promise<T> {
   return new Promise((res) => setTimeout(() => res(val), ms))
 }
 
-// Mutable in-memory state for interactive demo
 let violations = [...MOCK_VIOLATIONS]
 
 export const mockApi = {

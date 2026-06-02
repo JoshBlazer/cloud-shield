@@ -24,6 +24,18 @@ Parameters:
     NoEcho: true
     Description: "Slack incoming webhook URL (Block Kit alerts)"
 
+  ApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Pre-shared API key required in X-Api-Key header (leave empty to disable auth)"
+
+  SlackSigningSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Slack signing secret used to verify /slack/interact callbacks"
+
   DigestToEmail:
     Type: String
     Default: ""
@@ -111,6 +123,7 @@ Resources:
                   - s3:GetEncryptionConfiguration
                   - s3:GetBucketVersioning
                   - s3:GetBucketTagging
+                  - s3:GetBucketPolicy
                 Resource: "*"
               - Sid: EC2ReadAccess
                 Effect: Allow
@@ -127,6 +140,7 @@ Resources:
                   - iam:ListAccessKeys
                   - iam:GetAccountPasswordPolicy
                   - iam:ListUserTags
+                  - iam:GetAccountSummary
                 Resource: "*"
               - Sid: DynamoDBAccess
                 Effect: Allow
@@ -155,6 +169,11 @@ Resources:
                 Action:
                   - ses:SendEmail
                 Resource: "*"
+              - Sid: LambdaInvokeAuditor
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:cloudshield-auditor-${Environment}"
 
   # -------------------------------------------------------------------------
   # Audit Lambda — scheduled hourly
@@ -189,6 +208,11 @@ Resources:
       Handler: src.api.handler.api_handler
       Role: !GetAtt AuditorExecutionRole.Arn
       Description: "REST API for the CloudShield dashboard"
+      Environment:
+        Variables:
+          API_KEY:               !Ref ApiKey
+          SLACK_SIGNING_SECRET:  !Ref SlackSigningSecret
+          AUDITOR_FUNCTION_NAME: !Sub "cloudshield-auditor-${Environment}"
       Events:
         ApiRoot:
           Type: HttpApi

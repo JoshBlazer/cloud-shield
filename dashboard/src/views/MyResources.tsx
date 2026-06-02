@@ -40,50 +40,73 @@ export function MyResources() {
   const handleSnooze      = async (id: string, days: number) => { await mockApi.snooze(id, days); load() }
   const handleExempt      = async (id: string) => { await mockApi.exempt(id, ''); load() }
 
+  const openCount   = violations.filter((v) => v.status === 'OPEN').length
+  const totalActive = violations.length
+
+  const countLabel = loading ? 'Loading…'
+    : totalActive === 0 ? '0 violations'
+    : `${totalActive} active · ${openCount} open`
+
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Toolbar */}
-      <div className="flex items-center gap-4 px-6 py-4 border-b border-border bg-surface flex-shrink-0">
-        <h1 className="text-base font-semibold text-text">My Resources</h1>
+      <div
+        className="flex items-center gap-4 px-6 py-4 flex-shrink-0"
+        style={{
+          background: 'rgba(11,16,25,0.6)',
+          borderBottom: '1px solid rgba(255,255,255,0.05)',
+          backdropFilter: 'blur(8px)',
+        }}
+      >
+        <h1 className="text-base font-bold text-text">My Resources</h1>
+
         <select
           value={team}
           onChange={(e) => setTeam(e.target.value)}
-          className="bg-[#1a1a1a] border border-border text-text text-sm rounded px-3 py-1.5 focus:outline-none focus:border-[#434343]"
+          className="text-sm rounded-lg px-3 py-1.5 focus:outline-none transition-colors"
+          style={{
+            background: 'rgba(255,255,255,0.05)',
+            border: '1px solid rgba(255,255,255,0.09)',
+            color: '#dde3ef',
+          }}
         >
-          {TEAMS.map((t) => (
-            <option key={t} value={t}>{t}</option>
-          ))}
+          {TEAMS.map((t) => <option key={t} value={t}>{t}</option>)}
         </select>
-        <span className="ml-auto text-xs text-muted">
-          {loading ? 'Loading…' : `${violations.length} open violation${violations.length !== 1 ? 's' : ''}`}
+
+        <span className="ml-auto text-xs tabular-nums" style={{ color: '#4b5568' }}>
+          {countLabel}
         </span>
       </div>
 
-      {/* Cards with inline remediation */}
-      <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+      {/* Cards */}
+      <div className="flex-1 overflow-y-auto px-6 py-5 space-y-4">
         {loading ? (
-          <div className="text-center text-muted py-12">Loading…</div>
+          <div className="text-center py-16" style={{ color: '#4b5568' }}>Loading…</div>
         ) : violations.length === 0 ? (
-          <div className="text-center py-16">
-            <div className="text-4xl mb-3">✅</div>
-            <p className="text-subtle">Team <strong className="text-text">{team}</strong> has no open violations.</p>
+          <div className="text-center py-20">
+            <div
+              className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4"
+              style={{ background: 'rgba(74,222,128,0.08)', border: '1px solid rgba(74,222,128,0.15)' }}
+            >
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#4ade80" strokeWidth="1.5" strokeLinecap="round">
+                <polyline points="20,6 9,17 4,12"/>
+              </svg>
+            </div>
+            <p className="text-sm font-semibold" style={{ color: '#4ade80' }}>
+              Team <span style={{ color: '#dde3ef' }}>{team}</span> is clean
+            </p>
+            <p className="text-xs mt-1" style={{ color: '#4b5568' }}>No active violations</p>
           </div>
         ) : (
           violations.map((v) => (
-            <div key={v.pk}>
-              <ViolationCard
-                violation={v}
-                onAcknowledge={handleAcknowledge}
-                onSnooze={handleSnooze}
-                onExempt={handleExempt}
-              />
-              {REMEDIATION[v.rule_id] && (
-                <div className="mt-1 mx-0.5 px-4 py-2.5 bg-[#111] border border-border border-t-0 rounded-b-lg">
-                  <p className="text-[11px] text-muted uppercase tracking-widest mb-1 font-semibold">How to fix</p>
-                  <p className="text-xs text-subtle">{REMEDIATION[v.rule_id]}</p>
-                </div>
-              )}
-            </div>
+            <ViolationCard
+              key={v.pk}
+              violation={v}
+              onAcknowledge={handleAcknowledge}
+              onSnooze={handleSnooze}
+              onExempt={handleExempt}
+              showRemediation={REMEDIATION[v.rule_id]}
+            />
           ))
         )}
       </div>

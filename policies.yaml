@@ -7,7 +7,7 @@ rules:
       name: "No Public S3 Buckets"
       severity: CRITICAL
       check: public_access_block_disabled
-      description: "S3 bucket must have all public access block settings enabled"
+      description: "S3 bucket must have all four PublicAccessBlock settings enabled"
 
     - id: S3_002
       name: "S3 Server-Side Encryption Required"
@@ -19,7 +19,13 @@ rules:
       name: "S3 Versioning Required"
       severity: MEDIUM
       check: versioning_disabled
-      description: "S3 bucket must have versioning enabled to support recovery"
+      description: "S3 bucket must have versioning enabled to support point-in-time recovery"
+
+    - id: S3_004
+      name: "Bucket Policy Grants Public Access"
+      severity: CRITICAL
+      check: bucket_policy_public
+      description: "Bucket policy must not include a Statement that allows Principal: '*'"
 
   iam:
     - id: IAM_001
@@ -48,6 +54,12 @@ rules:
       prevent_reuse: 5
       description: "Account password policy must enforce complexity, rotation, and reuse prevention"
 
+    - id: IAM_004
+      name: "Root Account MFA Not Enabled"
+      severity: CRITICAL
+      check: root_mfa_disabled
+      description: "The AWS root account must have at least one MFA device registered"
+
   ec2:
     - id: EC2_001
       name: "No Unrestricted SSH Access"
@@ -74,4 +86,4 @@ rules:
       severity: MEDIUM
       check: unrestricted_ingress
       port: 80
-      description: "Security group should not allow HTTP (port 80) from 0.0.0.0/0"
+      description: "Security group should not expose HTTP (port 80) directly from 0.0.0.0/0"

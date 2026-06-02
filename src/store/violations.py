@@ -220,10 +220,19 @@ def get_active_pks(session: Any) -> set[str]:
 
 
 def get_summary(session: Any) -> dict[str, Any]:
-    items = _table(session).scan(
-        ProjectionExpression="#s, severity, team",
-        ExpressionAttributeNames={"#s": "status"},
-    ).get("Items", [])
+    table  = _table(session)
+    items: list[dict[str, Any]] = []
+    kwargs: dict[str, Any] = {
+        "ProjectionExpression": "#s, severity, team",
+        "ExpressionAttributeNames": {"#s": "status"},
+    }
+    # Paginate — scan returns at most 1 MB per call
+    while True:
+        resp = table.scan(**kwargs)
+        items.extend(resp.get("Items", []))
+        if "LastEvaluatedKey" not in resp:
+            break
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
 
     summary: dict[str, Any] = {
         "total": len(items),
