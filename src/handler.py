@@ -76,6 +76,11 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     cw_client  = session.client("cloudwatch", region_name=AWS_REGION)
     sns_client = session.client("sns",        region_name=AWS_REGION)
 
+    # Re-open any snoozed violations whose window has expired
+    woken = store.wake_snoozed_violations(session)
+    if woken:
+        log.info("handler.snooze_wakeup", count=woken)
+
     # Snapshot which violations were active before this run so we can detect resolutions
     pre_run_active_pks = store.get_active_pks(session)
 

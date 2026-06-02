@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+*.egg-info/
+dist/
+build/
+
+# AWS SAM build output
+.aws-sam/
+
+# Dashboard build artifacts and dependencies
+dashboard/node_modules/
+dashboard/dist/
+
+# Generated reports and screenshots (build artifacts, not source)
+report.html
+report_screenshot.png
+dash_*.png
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

@@ -105,6 +105,48 @@ class TestS3Auditor:
         violations = auditor.audit(s3_rules)
         assert violations == []
 
+    def test_detects_public_bucket_policy(self, mock_s3_session, s3_rules):
+        """S3_004 must fire when a bucket policy grants Principal: '*'."""
+        import json
+        s3 = mock_s3_session.client("s3")
+        s3.create_bucket(Bucket="policy-public-bucket")
+        s3.put_bucket_policy(
+            Bucket="policy-public-bucket",
+            Policy=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                    "Resource": "arn:aws:s3:::policy-public-bucket/*",
+                }],
+            }),
+        )
+        auditor = S3Auditor(mock_s3_session)
+        violations = auditor.audit(s3_rules)
+        assert "S3_004" in {v["rule_id"] for v in violations}
+
+    def test_private_bucket_policy_no_s3_004(self, mock_s3_session, s3_rules):
+        """S3_004 must not fire when the bucket policy restricts to a specific principal."""
+        import json
+        s3 = mock_s3_session.client("s3")
+        s3.create_bucket(Bucket="policy-private-bucket")
+        s3.put_bucket_policy(
+            Bucket="policy-private-bucket",
+            Policy=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+                    "Action": "s3:GetObject",
+                    "Resource": "arn:aws:s3:::policy-private-bucket/*",
+                }],
+            }),
+        )
+        auditor = S3Auditor(mock_s3_session)
+        violations = auditor.audit(s3_rules)
+        assert "S3_004" not in {v["rule_id"] for v in violations}
+
 
 # ---------------------------------------------------------------------------
 # EC2 / Security Group tests
@@ -349,3 +391,36 @@ class TestIAMAuditor:
         v = violations[0]
         assert v["resource_type"] == "AWS::IAM::PasswordPolicy"
         assert v["resource_id"] == "account-password-policy"
+
+    # --- Root MFA (IAM_004) ---
+
+    def test_detects_root_mfa_disabled(self, mock_iam_session):
+        """evaluate() must flag IAM_004 when root_mfa_active is False."""
+        auditor = IAMAuditor(mock_iam_session)
+        resources = [
+            {"type": "account_summary", "root_mfa_active": False},
+            {"type": "account", "password_policy": {}},
+        ]
+        root_mfa_rule = {
+            "id": "IAM_004", "name": "Root Account MFA Not Enabled",
+            "severity": "CRITICAL", "check": "root_mfa_disabled",
+        }
+        violations = auditor.evaluate(resources, [root_mfa_rule])
+        assert any(v["rule_id"] == "IAM_004" for v in violations)
+        v = next(v for v in violations if v["rule_id"] == "IAM_004")
+        assert v["resource_type"] == "AWS::IAM::RootAccount"
+        assert v["resource_id"] == "root"
+
+    def test_root_mfa_enabled_no_violation(self, mock_iam_session):
+        """evaluate() must not flag IAM_004 when root MFA is active."""
+        auditor = IAMAuditor(mock_iam_session)
+        resources = [
+            {"type": "account_summary", "root_mfa_active": True},
+            {"type": "account", "password_policy": {}},
+        ]
+        root_mfa_rule = {
+            "id": "IAM_004", "name": "Root Account MFA Not Enabled",
+            "severity": "CRITICAL", "check": "root_mfa_disabled",
+        }
+        violations = auditor.evaluate(resources, [root_mfa_rule])
+        assert not any(v["rule_id"] == "IAM_004" for v in violations)

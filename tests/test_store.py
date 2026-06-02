@@ -172,6 +172,50 @@ class TestLifecycle:
     def test_snooze_nonexistent_returns_false(self, ddb_session):
         assert store.snooze(ddb_session, "nonexistent-id") is False
 
+    def test_exemption_survives_reaudit(self, ddb_session, sample_violation):
+        """Exempted violations must not be recreated or re-alert when still detected."""
+        item, _ = store.upsert_violation(ddb_session, sample_violation)
+        vid = item["violation_id"]
+        store.exempt(ddb_session, vid, reason="legacy bucket, migration Q3")
+
+        # Simulate the next hourly audit finding the same violation still failing
+        _, is_new = store.upsert_violation(ddb_session, sample_violation)
+
+        assert is_new is False, "exempted violation must not fire a new alert"
+        refetched = store.get_by_id(ddb_session, vid)
+        assert refetched["status"] == store.STATUS_EXEMPTED, "status must remain EXEMPTED"
+        assert refetched["occurrence_count"] == 2  # last_seen + occurrence bumped silently
+
+    def test_snooze_wakeup_reopens_expired_item(self, ddb_session, sample_violation):
+        """Violations past their snooze_until must flip back to OPEN."""
+        from datetime import UTC, datetime, timedelta
+
+        item, _ = store.upsert_violation(ddb_session, sample_violation)
+        store.snooze(ddb_session, item["violation_id"], days=7)
+
+        # Backdate snooze_until to yesterday so the item is now overdue
+        past = (datetime.now(tz=UTC) - timedelta(days=1)).isoformat()
+        ddb_session.resource("dynamodb").Table("cloudshield-violations").update_item(
+            Key={"pk": item["pk"]},
+            UpdateExpression="SET snooze_until = :p",
+            ExpressionAttributeValues={":p": past},
+        )
+
+        woken = store.wake_snoozed_violations(ddb_session)
+        assert woken == 1
+        refetched = store.get_by_id(ddb_session, item["violation_id"])
+        assert refetched["status"] == store.STATUS_OPEN
+
+    def test_active_snooze_not_woken(self, ddb_session, sample_violation):
+        """Violations snoozed until the future must remain SNOOZED."""
+        item, _ = store.upsert_violation(ddb_session, sample_violation)
+        store.snooze(ddb_session, item["violation_id"], days=7)
+
+        woken = store.wake_snoozed_violations(ddb_session)
+        assert woken == 0
+        refetched = store.get_by_id(ddb_session, item["violation_id"])
+        assert refetched["status"] == store.STATUS_SNOOZED
+
 
 # ── read operations ───────────────────────────────────────────────────────────
 

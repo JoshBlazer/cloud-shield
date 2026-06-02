@@ -1,97 +1,146 @@
+import csv
+import io
+import time as _time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from .base_auditor import BaseAuditor
 
 log = structlog.get_logger()
 
+# Adaptive retry mode back-offs automatically under IAM's low rate limits
+_RETRY_CFG = Config(retries={"mode": "adaptive"})
+
 
 class IAMAuditor(BaseAuditor):
-    """Audits IAM users, access keys, password policy, and root account MFA."""
+    """
+    Audits IAM posture using the credential report (single API call) rather than
+    per-user fan-out — eliminates N×4 sequential calls and avoids IAM rate throttling.
+    User tags are still fetched per-user but in parallel via ThreadPoolExecutor.
+    """
 
     def __init__(self, session: Any) -> None:
         super().__init__(session)
-        self._client = session.client("iam")
+        self._client = session.client("iam", config=_RETRY_CFG)
 
-    def fetch_resources(self) -> list[dict[str, Any]]:
-        resources: list[dict[str, Any]] = []
+    # ── Credential report ─────────────────────────────────────────────────────
 
+    def _get_credential_report(self) -> list[dict[str, str]]:
+        """
+        Generate + download the IAM credential report.
+        Returns the CSV rows as a list of dicts, or [] on timeout.
+
+        AWS may return State=STARTED or INPROGRESS, and get_credential_report()
+        raises ReportInProgress until generation is done. Poll by attempting the
+        get() directly — this is simpler and works with moto (which returns a
+        usable report immediately regardless of the generate() state).
+        """
+        self._client.generate_credential_report()  # trigger generation (idempotent)
+        deadline = _time.time() + 30
+        while True:
+            try:
+                content = self._client.get_credential_report()["Content"].decode("utf-8")
+                return list(csv.DictReader(io.StringIO(content)))
+            except ClientError as exc:
+                code = exc.response["Error"]["Code"]
+                if code not in ("ReportInProgress", "ReportNotPresent"):
+                    raise
+                if _time.time() >= deadline:
+                    log.warning("iam.credential_report_timeout")
+                    return []
+                _time.sleep(2)
+
+    @staticmethod
+    def _parse_key_age(rotated_str: str) -> int | None:
+        """Return days since the key was last rotated, or None if unavailable."""
+        if not rotated_str or rotated_str in ("N/A", "no_information", "not_supported"):
+            return None
         try:
-            paginator = self._client.get_paginator("list_users")
-            for page in paginator.paginate():
-                for user in page.get("Users", []):
-                    username  = user["UserName"]
-                    user_tags = self._get_user_tags(username)
-                    resources.append(
-                        {
-                            "type":               "user",
-                            "username":           username,
-                            "has_console_access": self._has_console_access(username),
-                            "mfa_devices":        self._get_mfa_devices(username),
-                            "access_keys":        self._get_access_keys(username),
-                            "team":               user_tags.get("team", "untagged"),
-                            "owner":              user_tags.get("owner"),
-                        }
-                    )
-                    log.debug("iam.fetched_user", username=username)
-        except ClientError as exc:
-            log.error("iam.list_users failed", error=str(exc))
-
-        resources.append({"type": "account", "password_policy": self._get_password_policy()})
-        resources.append({"type": "account_summary", "root_mfa_active": self._is_root_mfa_active()})
-        return resources
-
-    # ── Per-user helpers ──────────────────────────────────────────────────────
+            rotated = datetime.fromisoformat(rotated_str.replace("Z", "+00:00"))
+            return (datetime.now(tz=UTC) - rotated).days
+        except ValueError:
+            return None
 
     def _get_user_tags(self, username: str) -> dict[str, str]:
         try:
             resp = self._client.list_user_tags(UserName=username)
-            return {tag["Key"]: tag["Value"] for tag in resp.get("Tags", [])}
+            return {t["Key"]: t["Value"] for t in resp.get("Tags", [])}
         except ClientError as exc:
             log.warning("iam.list_user_tags failed", username=username, error=str(exc))
             return {}
 
-    def _has_console_access(self, username: str) -> bool:
+    def _is_root_mfa_active(self) -> bool:
+        """Fallback for when the credential report omits the root account row."""
         try:
-            self._client.get_login_profile(UserName=username)
-            return True
+            return bool(self._client.get_account_summary()
+                        .get("SummaryMap", {}).get("AccountMFAEnabled", 0))
         except ClientError as exc:
-            if exc.response["Error"]["Code"] == "NoSuchEntity":
-                return False
-            log.warning("iam.get_login_profile failed", username=username, error=str(exc))
-            return False
+            log.warning("iam.get_account_summary failed", error=str(exc))
+            return True  # assume compliant to avoid false positives
 
-    def _get_mfa_devices(self, username: str) -> list[dict[str, Any]]:
-        try:
-            return self._client.list_mfa_devices(UserName=username).get("MFADevices", [])
-        except ClientError as exc:
-            log.warning("iam.list_mfa_devices failed", username=username, error=str(exc))
-            return []
+    # ── Resource fetching ─────────────────────────────────────────────────────
 
-    def _get_access_keys(self, username: str) -> list[dict[str, Any]]:
-        keys: list[dict[str, Any]] = []
-        try:
-            resp = self._client.list_access_keys(UserName=username)
-            now  = datetime.now(tz=UTC)
-            for meta in resp.get("AccessKeyMetadata", []):
-                created_at = meta["CreateDate"]
-                if created_at.tzinfo is None:
-                    created_at = created_at.replace(tzinfo=UTC)
-                keys.append(
-                    {
-                        "key_id":   meta["AccessKeyId"],
-                        "status":   meta["Status"],
-                        "age_days": (now - created_at).days,
-                    }
-                )
-        except ClientError as exc:
-            log.warning("iam.list_access_keys failed", username=username, error=str(exc))
-        return keys
+    def fetch_resources(self) -> list[dict[str, Any]]:
+        report = self._get_credential_report()
+        # Don't early-return on empty report — account-level resources are always appended below.
+        user_rows = [r for r in report if r.get("user") != "<root_account>"]
+        usernames = [r["user"] for r in user_rows]
 
-    # ── Account-level helpers ─────────────────────────────────────────────────
+        # Parallel tag fetches — the only remaining per-user API call
+        tags_by_user: dict[str, dict[str, str]] = {}
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            futures = {ex.submit(self._get_user_tags, u): u for u in usernames}
+            for future in as_completed(futures):
+                username = futures[future]
+                try:
+                    tags_by_user[username] = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("iam.tags_fetch_failed", username=username, error=str(exc))
+                    tags_by_user[username] = {}
+
+        resources: list[dict[str, Any]] = []
+        root_mfa_active: bool | None = None
+
+        for row in report:
+            username = row.get("user", "")
+
+            if username == "<root_account>":
+                root_mfa_active = row.get("mfa_active", "false").lower() == "true"
+                continue
+
+            keys: list[dict[str, Any]] = []
+            for n in ("1", "2"):
+                if row.get(f"access_key_{n}_active", "false").lower() == "true":
+                    age = self._parse_key_age(row.get(f"access_key_{n}_last_rotated", "N/A"))
+                    if age is not None:
+                        keys.append({"key_id": f"access-key-{n}", "status": "Active", "age_days": age})
+
+            tags = tags_by_user.get(username, {})
+            resources.append({
+                "type":               "user",
+                "username":           username,
+                "has_console_access": row.get("password_enabled", "false").lower() == "true",
+                "mfa_devices":        [{"SerialNumber": "mfa"}]
+                                      if row.get("mfa_active", "false").lower() == "true"
+                                      else [],
+                "access_keys":        keys,
+                "team":               tags.get("team", "untagged"),
+                "owner":              tags.get("owner"),
+            })
+            log.debug("iam.fetched_user", username=username)
+
+        # Credential report may omit the root account row in some environments
+        if root_mfa_active is None:
+            root_mfa_active = self._is_root_mfa_active()
+
+        resources.append({"type": "account_summary", "root_mfa_active": root_mfa_active})
+        resources.append({"type": "account", "password_policy": self._get_password_policy()})
+        return resources
 
     def _get_password_policy(self) -> dict[str, Any]:
         try:
@@ -102,15 +151,6 @@ class IAMAuditor(BaseAuditor):
             log.warning("iam.get_account_password_policy failed", error=str(exc))
             return {}
 
-    def _is_root_mfa_active(self) -> bool:
-        """AccountMFAEnabled = 1 means the root account has at least one MFA device."""
-        try:
-            resp = self._client.get_account_summary()
-            return bool(resp.get("SummaryMap", {}).get("AccountMFAEnabled", 0))
-        except ClientError as exc:
-            log.warning("iam.get_account_summary failed", error=str(exc))
-            return True  # assume compliant on error to avoid false positive
-
     # ── Evaluation ────────────────────────────────────────────────────────────
 
     def evaluate(
@@ -118,9 +158,9 @@ class IAMAuditor(BaseAuditor):
     ) -> list[dict[str, Any]]:
         violations: list[dict[str, Any]] = []
 
-        users          = [r for r in resources if r.get("type") == "user"]
-        account        = next((r for r in resources if r.get("type") == "account"), {})
-        acct_summary   = next((r for r in resources if r.get("type") == "account_summary"), {})
+        users        = [r for r in resources if r.get("type") == "user"]
+        account      = next((r for r in resources if r.get("type") == "account"), {})
+        acct_summary = next((r for r in resources if r.get("type") == "account_summary"), {})
 
         for rule in rules:
             check = rule.get("check")
@@ -148,7 +188,8 @@ class IAMAuditor(BaseAuditor):
                                     rule,
                                     f"{user['username']}/{key['key_id']}",
                                     "AWS::IAM::AccessKey",
-                                    f"Key '{key['key_id']}' for '{user['username']}' is {key['age_days']} days old (max {max_age})",
+                                    f"Key '{key['key_id']}' for '{user['username']}' is "
+                                    f"{key['age_days']} days old (max {max_age})",
                                     tags,
                                 )
                             )
@@ -183,9 +224,8 @@ class IAMAuditor(BaseAuditor):
         reasons: list[str] = []
         min_len = rule.get("min_length", 14)
         if policy.get("MinimumPasswordLength", 0) < min_len:
-            reasons.append(
-                f"Min length is {policy.get('MinimumPasswordLength', 0)}, required {min_len}"
-            )
+            reasons.append(f"Min length is {policy.get('MinimumPasswordLength', 0)}, required {min_len}")
+
         for flag, key in [
             ("require_uppercase", "RequireUppercaseCharacters"),
             ("require_lowercase", "RequireLowercaseCharacters"),
@@ -202,9 +242,8 @@ class IAMAuditor(BaseAuditor):
 
         min_reuse = rule.get("prevent_reuse", 5)
         if policy.get("PasswordReusePrevention", 0) < min_reuse:
-            reasons.append(
-                f"Reuse prevention is {policy.get('PasswordReusePrevention', 0)}, required {min_reuse}"
-            )
+            reasons.append(f"Reuse prevention is {policy.get('PasswordReusePrevention', 0)}, required {min_reuse}")
+
         return reasons
 
     @staticmethod

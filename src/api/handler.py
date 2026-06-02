@@ -120,12 +120,16 @@ def _session() -> Any:
 
 def _list_violations(event: dict, **_: Any) -> dict:
     qs = event.get("queryStringParameters") or {}
+    try:
+        limit = max(1, min(500, int(qs.get("limit", 200))))
+    except (ValueError, TypeError):
+        limit = 200
     items = store.list_violations(
         _session(),
         status=qs.get("status"),
         severity=qs.get("severity"),
         team=qs.get("team"),
-        limit=int(qs.get("limit", 200)),
+        limit=limit,
     )
     return _ok({"violations": items, "count": len(items)}, origin=event.get("_origin", ""))
 

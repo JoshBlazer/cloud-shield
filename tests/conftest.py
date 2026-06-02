@@ -54,6 +54,12 @@ def s3_rules():
             "severity": "MEDIUM",
             "check": "versioning_disabled",
         },
+        {
+            "id": "S3_004",
+            "name": "Bucket Policy Grants Public Access",
+            "severity": "CRITICAL",
+            "check": "bucket_policy_public",
+        },
     ]
 
 
@@ -85,6 +91,12 @@ def iam_rules():
             "require_symbols": True,
             "max_age_days": 90,
             "prevent_reuse": 5,
+        },
+        {
+            "id": "IAM_004",
+            "name": "Root Account MFA Not Enabled",
+            "severity": "CRITICAL",
+            "check": "root_mfa_disabled",
         },
     ]
 
