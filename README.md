@@ -118,39 +118,71 @@ Any active status ──► RESOLVED  (resource fixed, detected next audit)
 RESOLVED ──► OPEN               (regression — re-detected after resolution)
 ```
 
-Lifecycle transitions are available via the dashboard UI, Slack buttons, or `PATCH /violations/{id}`.
+Lifecycle transitions are available via the dashboard UI, Slack buttons, or `PATCH /violations/{id}`. Snoozes auto-expire: the auditor re-opens any snoozed violation past its `snooze_until` at the start of each run. Every transition (who, what, when, from→to) is written to a separate `cloudshield-audit-log` table and shown as a timeline on each violation card.
+
+## Authentication
+
+Two layers, picked per caller:
+
+- **Dashboard users** sign in through a Cognito hosted UI (OAuth2 + PKCE, no client secret). The SPA holds the resulting JWT in memory only (never localStorage) and sends it as `Authorization: Bearer <jwt>`. The API validates the token against the Cognito JWKS at the Lambda layer. This solves the "static SPA can't hold a secret" problem — there's no long-lived key in the bundle.
+- **Machine-to-machine** callers (CI, scripts) send `X-Api-Key: <key>`, checked in constant time.
+
+When neither `ApiKey` nor `COGNITO_ISSUER` is set (local dev), auth passes through. Secrets (`SlackWebhookUrl`, `ApiKey`, `SlackSigningSecret`) are stored in AWS Secrets Manager, not plain Lambda env vars.
+
+## Multi-account, multi-region
+
+The auditor scans a list of targets read from the `AuditTargetAccounts` parameter (JSON):
+
+```json
+[
+  {"account_id": "111122223333", "region": "us-east-1", "role_arn": "arn:aws:iam::111122223333:role/CloudShieldAuditRole"},
+  {"account_id": "444455556666", "region": "eu-west-1", "role_arn": "arn:aws:iam::444455556666:role/CloudShieldAuditRole"}
+]
+```
+
+For each target with a `role_arn`, the auditor assumes that role via STS and scans using the temporary credentials. Every violation is tagged with its `account_id` and `region`. Deploy `member-account-role.yaml` into each account you want scanned — it creates a read-only `CloudShieldAuditRole` trusting the central account (optionally hardened with an `ExternalId`). With no targets configured, the auditor falls back to scanning its own account and region.
+
+## Reliability
+
+- The auditor runs with `ReservedConcurrentExecutions: 1` so the hourly schedule and a manual `/audit/trigger` can never interleave their resolve-diff logic.
+- All three Lambdas and both EventBridge schedules have an SQS dead-letter queue (`cloudshield-dlq`, 14-day retention) — a failed run lands there for inspection and replay rather than vanishing.
+- `active-pk-index` is a sparse GSI: only OPEN/ACKNOWLEDGED/SNOOZED items carry the `active_pk` attribute, so RESOLVED/EXEMPTED rows drop off the index entirely. This keeps active-violation queries off a hot low-cardinality partition and shrinks the index.
+- Resolved violations get a 90-day DynamoDB TTL so the hot table stays bounded.
 
 ## API reference
 
-All endpoints require `X-Api-Key: <key>` when `ApiKey` is configured.
+Every endpoint accepts either `X-Api-Key: <key>` or `Authorization: Bearer <cognito-jwt>`.
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/violations` | List violations. Filters: `?status=OPEN&severity=CRITICAL&team=infra` |
 | GET | `/violations/{id}` | Get one violation by `violation_id` |
+| GET | `/violations/{id}/history` | Lifecycle audit trail for one violation, newest first |
 | PATCH | `/violations/{id}` | Lifecycle action: `{"action": "acknowledge"/"snooze"/"exempt"}` |
 | GET | `/summary` | Aggregate counts by status, severity, and team |
 | POST | `/audit/trigger` | Queue an out-of-cycle audit run (async, returns 202) |
-| POST | `/slack/interact` | Slack interactivity callback (Ack/Snooze buttons) |
+| POST | `/slack/interact` | Slack interactivity callback (signature-verified) |
 
 ## Project layout
 
 ```
 src/
   auditors/       base_auditor.py + s3/ec2/iam auditors
-  engine/         evaluator.py — orchestrates auditors, returns AuditResult
-  store/          violations.py — DynamoDB CRUD and lifecycle
+  engine/         evaluator.py — multi-account/region orchestration
+  store/          violations.py (CRUD + lifecycle), audit_log.py (transition trail)
   notifications/  slack.py + digest.py
-  api/            handler.py — API Gateway Lambda
+  api/            handler.py — API Gateway Lambda (API key + Cognito JWT auth)
   handler.py      main Lambda entrypoint (scheduled auditor)
 dashboard/        React + Vite + TypeScript + Tailwind + Recharts
-tests/            60 tests (moto-based, no real AWS needed)
-policies.yaml     declarative rule definitions
-template.yaml     SAM IaC (DynamoDB, Lambda, API GW, CloudFront, S3)
+  src/hooks/      useAuth.ts — Cognito PKCE flow
+tests/            81 tests (moto-based, no real AWS needed)
+policies.yaml         declarative rule definitions
+template.yaml         SAM IaC (DynamoDB, Lambda, API GW, CloudFront, Cognito, SQS, Secrets)
+member-account-role.yaml  read-only role to deploy in each scanned account
 ```
 
 ## Known limitations
 
-- Single account, single region. Cross-account org-wide scanning would require assuming roles per account.
-- `get_summary` uses a DynamoDB scan — fine for thousands of violations, needs a counter table at scale.
+- `get_summary` still uses a DynamoDB scan — fine for thousands of violations, but at much larger scale it should move to a maintained counter table.
 - No CloudTrail, RDS, KMS, or EBS rules yet — the auditor pattern makes adding them straightforward.
+- The dashboard does not paginate the violation list in the UI; the API caps results at 500 per call.

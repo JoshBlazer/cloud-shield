@@ -1,11 +1,16 @@
-import type { AuditTriggerResult, Summary, Violation } from '../types'
+import { getAccessToken } from '../hooks/useAuth'
+import type { AuditEvent, AuditTriggerResult, Summary, Violation } from '../types'
 
 const USE_MOCK = import.meta.env.VITE_USE_MOCK !== 'false'
 const BASE     = USE_MOCK ? '' : (import.meta.env.VITE_API_URL ?? '/api')
 
 async function req<T>(path: string, options?: RequestInit): Promise<T> {
+  const token = getAccessToken()
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     ...options,
   })
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
@@ -18,6 +23,10 @@ export const api = {
       Object.fromEntries(Object.entries(params).filter(([, v]) => v)) as Record<string, string>
     ).toString()
     return req<{ violations: Violation[]; count: number }>(`/violations${qs ? `?${qs}` : ''}`)
+  },
+
+  getViolationHistory(violationId: string) {
+    return req<{ violation_id: string; events: AuditEvent[] }>(`/violations/${violationId}/history`)
   },
 
   acknowledge(violationId: string, by = 'dashboard-user') {

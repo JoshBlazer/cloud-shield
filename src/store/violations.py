@@ -10,6 +10,8 @@ import structlog
 from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 
+from src.store import audit_log
+
 log = structlog.get_logger()
 
 TABLE_NAME = os.environ.get("VIOLATIONS_TABLE", "cloudshield-violations")
@@ -36,7 +38,6 @@ def _pk(rule_id: str, resource_id: str) -> str:
 
 
 def _stable_id(rule_id: str, resource_id: str) -> str:
-    """Deterministic UUID so the same violation always has the same ID."""
     return str(uuid.uuid5(uuid.NAMESPACE_OID, f"{rule_id}#{resource_id}"))
 
 
@@ -48,17 +49,17 @@ def upsert_violation(
     tags: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """
-    Idempotent, atomic violation write.
+    Atomic violation upsert. Three phases:
 
-    Phase 1 — conditional create: succeeds only when the pk doesn't exist.
-    Phase 2 — conditional update: bumps last_seen/occurrence if the item is
-               ACTIVE or EXEMPTED. Exempted resources are re-detected every run
-               but never re-alert (is_new stays False).
-    Phase 3 — unconditional overwrite: reached only when the item exists in
-               RESOLVED state, meaning the resource regressed after a fix.
-               Returns is_new=True so the caller re-alerts.
+    1. Conditional create (attribute_not_exists) — atomic, only one concurrent caller wins.
+    2. Conditional update — fires if item is ACTIVE or EXEMPTED; bumps last_seen silently.
+       EXEMPTED items are re-detected every run but never re-alert (is_new stays False).
+    3. Unconditional overwrite — reached only when item is RESOLVED (regression).
+       Returns is_new=True so the caller re-alerts.
 
-    Returns (item, is_new). is_new=True triggers Slack + email alerts.
+    active_pk mirrors status for ACTIVE items and is absent for RESOLVED/EXEMPTED.
+    This makes active-pk-index a sparse index — RESOLVED items are off the index entirely,
+    preventing the hot-partition problem of all OPEN items sharing one GSI partition.
     """
     table      = _table(session)
     rule_id    = violation["rule_id"]
@@ -67,50 +68,45 @@ def upsert_violation(
     now        = _now()
 
     new_item: dict[str, Any] = {
-        "pk":             pk,
-        "violation_id":   _stable_id(rule_id, resource_id),
-        "rule_id":        rule_id,
-        "rule_name":      violation["rule_name"],
-        "severity":       violation["severity"],
-        "resource_type":  violation["resource_type"],
-        "resource_id":    resource_id,
-        "reason":         violation["reason"],
-        "status":         STATUS_OPEN,
-        "first_detected": now,
-        "last_seen":      now,
+        "pk":               pk,
+        "violation_id":     _stable_id(rule_id, resource_id),
+        "rule_id":          rule_id,
+        "rule_name":        violation["rule_name"],
+        "severity":         violation["severity"],
+        "resource_type":    violation["resource_type"],
+        "resource_id":      resource_id,
+        "reason":           violation["reason"],
+        "status":           STATUS_OPEN,
+        "active_pk":        STATUS_OPEN,  # sparse index key — present only on active items
+        "first_detected":   now,
+        "last_seen":        now,
         "occurrence_count": 1,
-        "resolved_at":    None,
-        "acknowledged_by": None,
-        "acknowledged_at": None,
-        "snooze_until":   None,
-        "exempt_reason":  None,
+        "resolved_at":      None,
+        "acknowledged_by":  None,
+        "acknowledged_at":  None,
+        "snooze_until":     None,
+        "exempt_reason":    None,
         "team":  violation.get("team") or (tags or {}).get("team", "untagged"),
         "owner": violation.get("owner") or (tags or {}).get("owner"),
-        "region":     os.environ.get("AWS_REGION", "us-east-1"),
-        "account_id": os.environ.get("AWS_ACCOUNT_ID", "unknown"),
+        "region":     violation.get("region") or os.environ.get("AWS_REGION", "us-east-1"),
+        "account_id": violation.get("account_id") or os.environ.get("AWS_ACCOUNT_ID", "unknown"),
     }
 
-    # Phase 1: atomic create — only succeeds when pk is genuinely new
+    # Phase 1: atomic create
     try:
-        table.put_item(
-            Item=new_item,
-            ConditionExpression=Attr("pk").not_exists(),
-        )
+        table.put_item(Item=new_item, ConditionExpression=Attr("pk").not_exists())
         log.info("store.created", pk=pk)
         return new_item, True
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise
 
-    # Phase 2: item exists — bump occurrence if active or exempted (no re-alert)
-    # EXEMPTED is included so deliberate exceptions survive re-audit without re-alerting.
+    # Phase 2: exists and is active or exempted — bump silently
     try:
         result = table.update_item(
             Key={"pk": pk},
             UpdateExpression="SET last_seen = :ls, occurrence_count = occurrence_count + :one",
-            ConditionExpression=Attr("status").is_in(
-                list(ACTIVE_STATUSES | {STATUS_EXEMPTED})
-            ),
+            ConditionExpression=Attr("status").is_in(list(ACTIVE_STATUSES | {STATUS_EXEMPTED})),
             ExpressionAttributeValues={":ls": now, ":one": 1},
             ReturnValues="ALL_NEW",
         )
@@ -119,7 +115,7 @@ def upsert_violation(
         if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise
 
-    # Phase 3: item is RESOLVED — resource regressed, create fresh OPEN item
+    # Phase 3: was RESOLVED — regression, create fresh OPEN item
     table.put_item(Item=new_item)
     log.info("store.regression", pk=pk)
     return new_item, True
@@ -132,9 +128,17 @@ def acknowledge(session: Any, violation_id: str, by: str = "user") -> bool:
     now = _now()
     _table(session).update_item(
         Key={"pk": item["pk"]},
-        UpdateExpression="SET #s=:s, acknowledged_by=:by, acknowledged_at=:at",
+        UpdateExpression="SET #s=:acked, acknowledged_by=:by, acknowledged_at=:at, active_pk=:acked",
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": STATUS_ACKNOWLEDGED, ":by": by, ":at": now},
+        ExpressionAttributeValues={":acked": STATUS_ACKNOWLEDGED, ":by": by, ":at": now},
+    )
+    audit_log.log_transition(
+        session,
+        violation_id=violation_id,
+        action="acknowledge",
+        actor=by,
+        from_status=item.get("status", STATUS_OPEN),
+        to_status=STATUS_ACKNOWLEDGED,
     )
     log.info("store.acknowledged", violation_id=violation_id, by=by)
     return True
@@ -147,9 +151,18 @@ def snooze(session: Any, violation_id: str, days: int = 7) -> bool:
     until = (datetime.now(tz=UTC) + timedelta(days=days)).isoformat()
     _table(session).update_item(
         Key={"pk": item["pk"]},
-        UpdateExpression="SET #s=:s, snooze_until=:u",
+        UpdateExpression="SET #s=:snoozed, snooze_until=:u, active_pk=:snoozed",
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": STATUS_SNOOZED, ":u": until},
+        ExpressionAttributeValues={":snoozed": STATUS_SNOOZED, ":u": until},
+    )
+    audit_log.log_transition(
+        session,
+        violation_id=violation_id,
+        action="snooze",
+        actor="dashboard-user",
+        from_status=item.get("status", STATUS_OPEN),
+        to_status=STATUS_SNOOZED,
+        context=f"{days}d",
     )
     log.info("store.snoozed", violation_id=violation_id, days=days)
     return True
@@ -161,28 +174,44 @@ def exempt(session: Any, violation_id: str, reason: str = "") -> bool:
         return False
     _table(session).update_item(
         Key={"pk": item["pk"]},
-        UpdateExpression="SET #s=:s, exempt_reason=:r",
+        UpdateExpression="SET #s=:ex, exempt_reason=:r REMOVE active_pk",
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": STATUS_EXEMPTED, ":r": reason},
+        ExpressionAttributeValues={":ex": STATUS_EXEMPTED, ":r": reason},
+    )
+    audit_log.log_transition(
+        session,
+        violation_id=violation_id,
+        action="exempt",
+        actor="dashboard-user",
+        from_status=item.get("status", STATUS_OPEN),
+        to_status=STATUS_EXEMPTED,
+        context=reason,
     )
     log.info("store.exempted", violation_id=violation_id)
     return True
 
 
 def mark_resolved(session: Any, pk: str) -> None:
-    ttl = int(time.time()) + 90 * 86_400  # DynamoDB TTL: expire item 90 days after resolution
+    ttl = int(time.time()) + 90 * 86_400  # expire 90 days after resolution
     try:
-        _table(session).update_item(
+        result = _table(session).update_item(
             Key={"pk": pk},
-            UpdateExpression="SET #s=:s, resolved_at=:r, #ttl=:ttl",
+            UpdateExpression="SET #s=:s, resolved_at=:r, #ttl=:ttl REMOVE active_pk",
             ExpressionAttributeNames={"#s": "status", "#ttl": "ttl"},
-            ExpressionAttributeValues={
-                ":s": STATUS_RESOLVED,
-                ":r": _now(),
-                ":ttl": ttl,
-            },
+            ExpressionAttributeValues={":s": STATUS_RESOLVED, ":r": _now(), ":ttl": ttl},
             ConditionExpression=Attr("status").is_in(list(ACTIVE_STATUSES)),
+            ReturnValues="ALL_NEW",
         )
+        vid = result["Attributes"].get("violation_id", "")
+        if vid:
+            audit_log.log_transition(
+                session,
+                violation_id=vid,
+                action="resolve",
+                actor="auditor",
+                from_status=STATUS_OPEN,
+                to_status=STATUS_RESOLVED,
+            )
         log.info("store.resolved", pk=pk)
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
@@ -190,20 +219,16 @@ def mark_resolved(session: Any, pk: str) -> None:
 
 
 def wake_snoozed_violations(session: Any) -> int:
-    """
-    Re-open any SNOOZED violations whose snooze_until has passed.
-    Call this at the start of each audit run before evaluating resources.
-    Returns the number of items flipped back to OPEN.
-    """
+    """Re-open any SNOOZED violations whose snooze_until has passed."""
     table = _table(session)
     now   = _now()
     woken = 0
 
     kwargs: dict[str, Any] = {
-        "IndexName": "status-index",
-        "KeyConditionExpression": Key("status").eq(STATUS_SNOOZED),
+        "IndexName": "active-pk-index",
+        "KeyConditionExpression": Key("active_pk").eq(STATUS_SNOOZED),
         "FilterExpression": Attr("snooze_until").lt(now),
-        "ProjectionExpression": "pk",
+        "ProjectionExpression": "pk, violation_id",
     }
     while True:
         resp = table.query(**kwargs)
@@ -211,12 +236,21 @@ def wake_snoozed_violations(session: Any) -> int:
             try:
                 table.update_item(
                     Key={"pk": item["pk"]},
-                    UpdateExpression="SET #s = :open, snooze_until = :null",
+                    UpdateExpression="SET #s = :open, active_pk = :open, snooze_until = :null",
                     ExpressionAttributeNames={"#s": "status"},
                     ExpressionAttributeValues={":open": STATUS_OPEN, ":null": None},
                     ConditionExpression=Attr("status").eq(STATUS_SNOOZED),
                 )
                 woken += 1
+                if item.get("violation_id"):
+                    audit_log.log_transition(
+                        session,
+                        violation_id=item["violation_id"],
+                        action="wake",
+                        actor="auditor",
+                        from_status=STATUS_SNOOZED,
+                        to_status=STATUS_OPEN,
+                    )
                 log.info("store.woken", pk=item["pk"])
             except ClientError as exc:
                 if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
@@ -251,7 +285,6 @@ def list_violations(
     items: list[dict[str, Any]] = []
 
     if team:
-        # team-index: paginate up to limit (team queries are user-scoped, cap is intentional)
         kwargs: dict[str, Any] = {
             "IndexName": "team-index",
             "KeyConditionExpression": Key("team").eq(team),
@@ -262,11 +295,11 @@ def list_violations(
         resp = table.query(**kwargs)
         items = resp.get("Items", [])
 
-    elif status:
-        # status-index: paginate all matching items
+    elif status in ACTIVE_STATUSES:
+        # active-pk-index: sparse — RESOLVED/EXEMPTED items are not here
         kwargs = {
-            "IndexName": "status-index",
-            "KeyConditionExpression": Key("status").eq(status),
+            "IndexName": "active-pk-index",
+            "KeyConditionExpression": Key("active_pk").eq(status),
         }
         if severity:
             kwargs["FilterExpression"] = Attr("severity").eq(severity)
@@ -278,8 +311,21 @@ def list_violations(
             kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
         items = items[:limit]
 
+    elif status:
+        # RESOLVED / EXEMPTED: off the sparse index, scan with filter
+        kwargs = {"FilterExpression": Attr("status").eq(status)}
+        if severity:
+            kwargs["FilterExpression"] = kwargs["FilterExpression"] & Attr("severity").eq(severity)
+        while True:
+            resp = table.scan(**kwargs)
+            items.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp or len(items) >= limit:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        items = items[:limit]
+
     else:
-        # Full scan — paginate across all pages
+        # No filter — full scan
         kwargs = {}
         if severity:
             kwargs["FilterExpression"] = Attr("severity").eq(severity)
@@ -295,13 +341,13 @@ def list_violations(
 
 
 def get_active_pks(session: Any) -> set[str]:
-    """Return all PKs in an active (non-resolved/non-exempted) status, with pagination."""
+    """Return all PKs in an active status, paginated. Uses sparse active-pk-index."""
     pks: set[str] = set()
     table = _table(session)
     for s in ACTIVE_STATUSES:
         kwargs: dict[str, Any] = {
-            "IndexName": "status-index",
-            "KeyConditionExpression": Key("status").eq(s),
+            "IndexName": "active-pk-index",
+            "KeyConditionExpression": Key("active_pk").eq(s),
             "ProjectionExpression": "pk",
         }
         while True:

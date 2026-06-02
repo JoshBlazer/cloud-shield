@@ -1,3 +1,7 @@
+"""Policy evaluator — runs all auditors against one or more account/region targets."""
+
+import json
+import os
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -14,7 +18,7 @@ log = structlog.get_logger()
 _POLICY_PATH = Path(__file__).parent.parent.parent / "policies.yaml"
 
 _AUDITOR_MAP = {
-    "s3": S3Auditor,
+    "s3":  S3Auditor,
     "ec2": EC2Auditor,
     "iam": IAMAuditor,
 }
@@ -30,19 +34,29 @@ def _load_policies(path: Path = _POLICY_PATH) -> dict[str, Any]:
         return yaml.safe_load(fh)
 
 
-def run_audit(session: Any = None) -> AuditResult:
-    """
-    Load policies, instantiate auditors, and collect all violations.
+def _assume_role_session(base_session: Any, role_arn: str, account_id: str, region: str) -> Any:
+    """Assume a cross-account role and return a boto3 Session for that account."""
+    sts   = base_session.client("sts")
+    creds = sts.assume_role(
+        RoleArn=role_arn,
+        RoleSessionName=f"cloudshield-audit-{account_id}",
+        DurationSeconds=3600,
+    )["Credentials"]
+    return boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+        region_name=region or None,
+    )
 
-    Calls fetch_resources() and evaluate() separately so the evaluator can
-    count total resources audited without a second round-trip to the cloud.
-    """
-    if session is None:
-        session = boto3.Session()
 
-    policies = _load_policies()
-    rules_by_service: dict[str, list[dict[str, Any]]] = policies.get("rules", {})
-
+def _audit_target(
+    session: Any,
+    account_id: str,
+    region: str,
+    rules_by_service: dict[str, list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Run all auditors for one account/region. Returns (violations, resources_audited)."""
     all_violations: list[dict[str, Any]] = []
     total_resources = 0
 
@@ -52,19 +66,80 @@ def run_audit(session: Any = None) -> AuditResult:
             log.warning("evaluator.unknown_service", service=service)
             continue
 
-        log.info("evaluator.starting_audit", service=service, rule_count=len(rules))
-        auditor = auditor_cls(session)
-
+        log.info("evaluator.starting_audit", service=service, account=account_id, region=region)
+        auditor   = auditor_cls(session)
         resources = auditor.fetch_resources()
         total_resources += len(resources)
 
         violations = auditor.evaluate(resources, rules)
+        # Tag every violation with the account and region it came from
+        for v in violations:
+            v.setdefault("account_id", account_id)
+            v.setdefault("region", region)
+
         log.info(
             "evaluator.audit_complete",
-            service=service,
-            resource_count=len(resources),
-            violation_count=len(violations),
+            service=service, account=account_id, region=region,
+            resources=len(resources), violations=len(violations),
         )
         all_violations.extend(violations)
+
+    return all_violations, total_resources
+
+
+def run_audit(
+    session: Any = None,
+    targets: list[dict[str, str]] | None = None,
+) -> AuditResult:
+    """
+    Run security audits across one or more account/region targets.
+
+    targets: list of {"account_id": str, "region": str, "role_arn": str (optional)}
+             If None, reads AUDIT_TARGETS env var (JSON array).
+             Falls back to auditing the current account/region with the default session.
+
+    Cross-account: when role_arn is set, assumes that role via STS and audits using
+    the resulting temporary credentials. The base session needs sts:AssumeRole.
+    """
+    if session is None:
+        session = boto3.Session()
+
+    if targets is None:
+        raw = os.environ.get("AUDIT_TARGETS", "[]")
+        try:
+            targets = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            targets = []
+
+    if not targets:
+        # Default: audit current account/region
+        targets = [{"account_id": "", "region": "", "role_arn": ""}]
+
+    policies        = _load_policies()
+    rules_by_service = policies.get("rules", {})
+
+    all_violations: list[dict[str, Any]] = []
+    total_resources = 0
+
+    default_account = os.environ.get("AWS_ACCOUNT_ID", "")
+    default_region  = os.environ.get("AWS_REGION", "us-east-1")
+
+    for target in targets:
+        account_id = target.get("account_id") or default_account
+        region     = target.get("region")     or default_region
+        role_arn   = target.get("role_arn",   "")
+
+        try:
+            target_session = (
+                _assume_role_session(session, role_arn, account_id, region)
+                if role_arn else session
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("evaluator.assume_role_failed", account=account_id, role=role_arn, error=str(exc))
+            continue
+
+        violations, resources = _audit_target(target_session, account_id, region, rules_by_service)
+        all_violations.extend(violations)
+        total_resources += resources
 
     return AuditResult(violations=all_violations, resources_audited=total_resources)

@@ -11,62 +11,86 @@ from typing import Any
 import boto3
 import structlog
 
+from src.store import audit_log
 from src.store import violations as store
 
 log = structlog.get_logger()
 
-# Optional API key — if set, every non-OPTIONS request must carry X-Api-Key
-_API_KEY            = os.environ.get("API_KEY", "")
-_SLACK_SIGNING_SEC  = os.environ.get("SLACK_SIGNING_SECRET", "")
-_AUDITOR_FUNCTION   = os.environ.get("AUDITOR_FUNCTION_NAME", "")
+_API_KEY           = os.environ.get("API_KEY", "")
+_SLACK_SIGNING_SEC = os.environ.get("SLACK_SIGNING_SECRET", "")
+_AUDITOR_FUNCTION  = os.environ.get("AUDITOR_FUNCTION_NAME", "")
+_COGNITO_ISSUER    = os.environ.get("COGNITO_ISSUER", "")
+_COGNITO_CLIENT_ID = os.environ.get("COGNITO_CLIENT_ID", "")
 
 _ALLOWED_ORIGINS: set[str] = {
     o for o in (
         os.environ.get("DASHBOARD_URL", "").rstrip("/"),
         "http://localhost:3000",
         "http://localhost:4173",
+        "http://localhost:5173",
     ) if o
 }
+
+# Module-level JWKS cache — persists across warm invocations
+_JWKS_CACHE: dict = {}
 
 
 # ── Event parsing ─────────────────────────────────────────────────────────────
 
 def _parse_event(event: dict) -> tuple[str, str, dict[str, str]]:
-    """Support payload format 1.0 (REST/httpMethod) and 2.0 (HTTP API/requestContext)."""
+    """Support payload format 1.0 (httpMethod/path) and 2.0 (requestContext.http/rawPath)."""
     rc       = event.get("requestContext", {})
     http_ctx = rc.get("http", {})
-
-    method = (
-        http_ctx.get("method")      # payload 2.0
-        or event.get("httpMethod")  # payload 1.0
-        or "GET"
-    ).upper()
-
-    path = (
-        event.get("rawPath")        # payload 2.0
-        or event.get("path")        # payload 1.0
-        or "/"
-    )
-
-    # Normalize header names — HTTP/2 sends lowercase, REST API sends mixed-case
-    raw_headers: dict[str, str] = event.get("headers", {}) or {}
-    headers = {k.lower(): v for k, v in raw_headers.items()}
-
+    method = (http_ctx.get("method") or event.get("httpMethod") or "GET").upper()
+    path   = event.get("rawPath") or event.get("path") or "/"
+    raw    = event.get("headers", {}) or {}
+    headers = {k.lower(): v for k, v in raw.items()}
     return method, path, headers
 
 
-# ── Auth helpers ──────────────────────────────────────────────────────────────
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+def _load_jwks() -> dict:
+    global _JWKS_CACHE
+    if _JWKS_CACHE:
+        return _JWKS_CACHE
+    import urllib.request
+    url = f"{_COGNITO_ISSUER}/.well-known/jwks.json"
+    with urllib.request.urlopen(url, timeout=5) as r:  # noqa: S310
+        _JWKS_CACHE = json.loads(r.read())
+    return _JWKS_CACHE
+
+
+def _verify_jwt(token: str) -> bool:
+    if not _COGNITO_ISSUER or not _COGNITO_CLIENT_ID:
+        return False
+    try:
+        from jose import jwt as jose_jwt
+        jwks = _load_jwks()
+        jose_jwt.decode(token, jwks, algorithms=["RS256"], audience=_COGNITO_CLIENT_ID)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
 
 def _is_authorized(headers: dict[str, str]) -> bool:
-    """Constant-time API key check. Passes through when no key is configured."""
-    if not _API_KEY:
+    """Accept API key (machine-to-machine) OR Cognito JWT Bearer token (dashboard)."""
+    # API key — constant-time to prevent timing oracle
+    if _API_KEY:
+        provided = headers.get("x-api-key", "")
+        if provided and hmac.compare_digest(provided, _API_KEY):
+            return True
+
+    # Cognito JWT Bearer
+    auth = headers.get("authorization", "")
+    if auth.startswith("Bearer ") and _verify_jwt(auth[7:]):
         return True
-    provided = headers.get("x-api-key", "")
-    return bool(provided) and hmac.compare_digest(provided, _API_KEY)
+
+    # Neither API key nor JWT configured → dev/local mode, pass through
+    return not (_API_KEY or _COGNITO_ISSUER)
 
 
 def _verify_slack_signature(event: dict, headers: dict[str, str]) -> bool:
-    """Verify Slack signing secret to block spoofed button callbacks."""
     if not _SLACK_SIGNING_SEC:
         return True
     timestamp  = headers.get("x-slack-request-timestamp", "")
@@ -75,14 +99,13 @@ def _verify_slack_signature(event: dict, headers: dict[str, str]) -> bool:
         return False
     try:
         if abs(time.time() - int(timestamp)) > 300:
-            return False  # outside 5-minute replay window
+            return False
     except ValueError:
         return False
     body     = event.get("body", "") or ""
     sig_base = f"v0:{timestamp}:{body}"
     mac      = hmac.new(_SLACK_SIGNING_SEC.encode(), sig_base.encode(), hashlib.sha256)
-    expected = "v0=" + mac.hexdigest()
-    return hmac.compare_digest(expected, sig_header)
+    return hmac.compare_digest("v0=" + mac.hexdigest(), sig_header)
 
 
 # ── Response helpers ──────────────────────────────────────────────────────────
@@ -92,7 +115,7 @@ def _cors(origin: str) -> dict[str, str]:
     return {
         "Access-Control-Allow-Origin":  allowed,
         "Access-Control-Allow-Methods": "GET,POST,PATCH,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type,X-Api-Key",
+        "Access-Control-Allow-Headers": "Content-Type,X-Api-Key,Authorization",
     }
 
 
@@ -135,10 +158,17 @@ def _list_violations(event: dict, **_: Any) -> dict:
 
 
 def _get_violation(event: dict, violation_id: str) -> dict:
-    item = store.get_by_id(_session(), violation_id)
+    origin = event.get("_origin", "")
+    item   = store.get_by_id(_session(), violation_id)
     if not item:
-        return _err("violation not found", 404, origin=event.get("_origin", ""))
-    return _ok(item, origin=event.get("_origin", ""))
+        return _err("violation not found", 404, origin=origin)
+    return _ok(item, origin=origin)
+
+
+def _get_violation_history(event: dict, violation_id: str) -> dict:
+    origin = event.get("_origin", "")
+    events = audit_log.get_history(_session(), violation_id)
+    return _ok({"violation_id": violation_id, "events": events}, origin=origin)
 
 
 def _patch_violation(event: dict, violation_id: str) -> dict:
@@ -170,31 +200,27 @@ def _get_summary(event: dict, **_: Any) -> dict:
 
 
 def _trigger_audit(event: dict, **_: Any) -> dict:
-    """Fire the auditor Lambda asynchronously — returns 202 immediately."""
     origin = event.get("_origin", "")
     if not _AUDITOR_FUNCTION:
         return _err("AUDITOR_FUNCTION_NAME not configured", 500, origin=origin)
     boto3.client("lambda").invoke(
         FunctionName=_AUDITOR_FUNCTION,
-        InvocationType="Event",  # async — Lambda queues and returns 202
+        InvocationType="Event",
         Payload=b"{}",
     )
     return _ok({"triggered": True, "message": "Audit queued"}, 202, origin=origin)
 
 
 def _slack_interact(event: dict, headers: dict[str, str]) -> dict:
-    """Handle Slack interactivity callbacks (Acknowledge / Snooze buttons)."""
     import urllib.parse
-
     if not _verify_slack_signature(event, headers):
         return _err("invalid Slack signature", 401)
 
-    raw    = event.get("body", "")
-    parsed = urllib.parse.parse_qs(raw)
-    payload_str = parsed.get("payload", ["{}"])[0]
-    payload = json.loads(payload_str)
-
+    raw     = event.get("body", "")
+    parsed  = urllib.parse.parse_qs(raw)
+    payload = json.loads(parsed.get("payload", ["{}"])[0])
     session = _session()
+
     for action in payload.get("actions", []):
         action_id = action.get("action_id", "")
         value     = action.get("value", "")
@@ -211,12 +237,14 @@ def _slack_interact(event: dict, headers: dict[str, str]) -> dict:
 # ── Router ────────────────────────────────────────────────────────────────────
 
 _ROUTES: list[tuple[str, str, Any]] = [
-    ("GET",   r"^/violations$",               _list_violations),
-    ("GET",   r"^/violations/(?P<id>[^/]+)$", _get_violation),
-    ("PATCH", r"^/violations/(?P<id>[^/]+)$", _patch_violation),
-    ("GET",   r"^/summary$",                  _get_summary),
-    ("POST",  r"^/audit/trigger$",            _trigger_audit),
-    ("POST",  r"^/slack/interact$",           _slack_interact),
+    ("GET",   r"^/violations$",                         _list_violations),
+    # history before bare /{id} so the more specific pattern wins
+    ("GET",   r"^/violations/(?P<id>[^/]+)/history$",   _get_violation_history),
+    ("GET",   r"^/violations/(?P<id>[^/]+)$",           _get_violation),
+    ("PATCH", r"^/violations/(?P<id>[^/]+)$",           _patch_violation),
+    ("GET",   r"^/summary$",                            _get_summary),
+    ("POST",  r"^/audit/trigger$",                      _trigger_audit),
+    ("POST",  r"^/slack/interact$",                     _slack_interact),
 ]
 
 
@@ -224,15 +252,12 @@ def api_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     method, path, headers = _parse_event(event)
     origin = headers.get("origin", "")
 
-    # CORS preflight — no auth required
     if method == "OPTIONS":
         return {"statusCode": 200, "headers": _cors(origin), "body": ""}
 
-    # Authenticate every other request (passthrough when API_KEY not set)
     if not _is_authorized(headers):
         return _err("unauthorized", 401, origin=origin)
 
-    # Thread origin through so route handlers can include it in responses
     event["_origin"] = origin
 
     for http_method, pattern, fn in _ROUTES:

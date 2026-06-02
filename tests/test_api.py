@@ -31,7 +31,7 @@ def api_session(aws_credentials):
             AttributeDefinitions=[
                 {"AttributeName": "pk",           "AttributeType": "S"},
                 {"AttributeName": "violation_id", "AttributeType": "S"},
-                {"AttributeName": "status",       "AttributeType": "S"},
+                {"AttributeName": "active_pk",    "AttributeType": "S"},
                 {"AttributeName": "team",         "AttributeType": "S"},
                 {"AttributeName": "last_seen",    "AttributeType": "S"},
             ],
@@ -43,9 +43,9 @@ def api_session(aws_credentials):
                     "Projection": {"ProjectionType": "ALL"},
                 },
                 {
-                    "IndexName": "status-index",
+                    "IndexName": "active-pk-index",
                     "KeySchema": [
-                        {"AttributeName": "status",    "KeyType": "HASH"},
+                        {"AttributeName": "active_pk", "KeyType": "HASH"},
                         {"AttributeName": "last_seen", "KeyType": "RANGE"},
                     ],
                     "Projection": {"ProjectionType": "ALL"},

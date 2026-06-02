@@ -1,9 +1,8 @@
 /**
- * Mock API — mirrors the real API shape so the dashboard can be
- * demoed locally without a deployed AWS backend.
- * Swap VITE_USE_MOCK=false to hit the real API Gateway.
+ * Mock API — mirrors the real API shape so the dashboard runs without AWS.
+ * Set VITE_USE_MOCK=false to hit the real API Gateway.
  */
-import type { AuditTriggerResult, Summary, Violation } from '../types'
+import type { AuditEvent, AuditTriggerResult, Summary, Violation } from '../types'
 
 const NOW      = new Date().toISOString()
 const HOUR_AGO = new Date(Date.now() - 3_600_000).toISOString()
@@ -96,7 +95,6 @@ export const MOCK_VIOLATIONS: Violation[] = [
   },
 ]
 
-// total = 4+1+1+6+2 = 14; RESOLVED (6) < total (14) → score = 43%
 export const MOCK_SUMMARY: Summary = {
   total: 14,
   by_status:   { OPEN: 4, ACKNOWLEDGED: 1, SNOOZED: 1, RESOLVED: 6, EXEMPTED: 2 },
@@ -110,11 +108,21 @@ export const MOCK_SUMMARY: Summary = {
 }
 
 export const MOCK_TREND = Array.from({ length: 7 }, (_, i) => ({
-  day: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][i],
+  day:      ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][i],
   CRITICAL: [6, 7, 5, 8, 6, 4, 4][i],
   HIGH:     [3, 2, 3, 2, 2, 2, 2][i],
   MEDIUM:   [2, 1, 2, 1, 1, 1, 1][i],
 }))
+
+const MOCK_HISTORY: Record<string, AuditEvent[]> = {
+  'v-s3-001-raw': [
+    { violation_id: 'v-s3-001-raw', timestamp: HOUR_AGO, action: 'detect',      actor: 'auditor',           from_status: '',     to_status: 'OPEN',   context: '' },
+  ],
+  'v-s3-001-up': [
+    { violation_id: 'v-s3-001-up',  timestamp: HOUR_AGO, action: 'acknowledge', actor: 'alice@acme.com',    from_status: 'OPEN', to_status: 'ACKNOWLEDGED', context: '' },
+    { violation_id: 'v-s3-001-up',  timestamp: DAY_AGO,  action: 'detect',      actor: 'auditor',           from_status: '',     to_status: 'OPEN',   context: '' },
+  ],
+}
 
 function delay<T>(val: T, ms = 300): Promise<T> {
   return new Promise((res) => setTimeout(() => res(val), ms))
@@ -129,6 +137,11 @@ export const mockApi = {
     if (params.severity) items = items.filter((v) => v.severity === params.severity)
     if (params.team)     items = items.filter((v) => v.team === params.team)
     return delay({ violations: items, count: items.length })
+  },
+
+  getViolationHistory(violationId: string) {
+    const events = MOCK_HISTORY[violationId] ?? []
+    return delay({ violation_id: violationId, events })
   },
 
   acknowledge(violationId: string, by = 'dashboard-user') {
@@ -160,6 +173,6 @@ export const mockApi = {
   },
 
   triggerAudit(): Promise<AuditTriggerResult> {
-    return delay({ resources_audited: 10, violations_found: violations.filter((v) => v.status === 'OPEN').length })
+    return delay({ triggered: true, message: 'Audit queued' })
   },
 }

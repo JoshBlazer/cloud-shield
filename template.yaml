@@ -15,6 +15,7 @@ Globals:
         CLOUDWATCH_NAMESPACE:    CloudShield/Auditor
         AWS_ACCOUNT_ID:          !Ref AWS::AccountId
         VIOLATIONS_TABLE:        !Ref ViolationsTable
+        AUDIT_LOG_TABLE:         !Ref AuditLogTable
         DASHBOARD_URL:           !Sub "https://${DashboardDistribution.DomainName}"
         SLACK_WEBHOOK_URL:       !Ref SlackWebhookUrl
 
@@ -28,13 +29,18 @@ Parameters:
     Type: String
     NoEcho: true
     Default: ""
-    Description: "Pre-shared API key required in X-Api-Key header (leave empty to disable auth)"
+    Description: "Pre-shared API key for X-Api-Key header (machine-to-machine auth)"
 
   SlackSigningSecret:
     Type: String
     NoEcho: true
     Default: ""
-    Description: "Slack signing secret used to verify /slack/interact callbacks"
+    Description: "Slack signing secret to verify /slack/interact callbacks"
+
+  AuditTargetAccounts:
+    Type: String
+    Default: "[]"
+    Description: 'Cross-account targets JSON: [{"account_id":"...","region":"...","role_arn":"..."}]'
 
   DigestToEmail:
     Type: String
@@ -73,7 +79,7 @@ Resources:
       AttributeDefinitions:
         - { AttributeName: pk,           AttributeType: S }
         - { AttributeName: violation_id, AttributeType: S }
-        - { AttributeName: status,       AttributeType: S }
+        - { AttributeName: active_pk,    AttributeType: S }
         - { AttributeName: team,         AttributeType: S }
         - { AttributeName: last_seen,    AttributeType: S }
       KeySchema:
@@ -83,9 +89,9 @@ Resources:
           KeySchema:
             - { AttributeName: violation_id, KeyType: HASH }
           Projection: { ProjectionType: ALL }
-        - IndexName: status-index
+        - IndexName: active-pk-index
           KeySchema:
-            - { AttributeName: status,    KeyType: HASH }
+            - { AttributeName: active_pk, KeyType: HASH }
             - { AttributeName: last_seen, KeyType: RANGE }
           Projection: { ProjectionType: ALL }
         - IndexName: team-index
@@ -93,6 +99,111 @@ Resources:
             - { AttributeName: team,      KeyType: HASH }
             - { AttributeName: last_seen, KeyType: RANGE }
           Projection: { ProjectionType: ALL }
+      Tags:
+        - { Key: Project, Value: CloudShield }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # -------------------------------------------------------------------------
+  # SQS — dead-letter queue for failed Lambda invocations and schedules
+  # -------------------------------------------------------------------------
+  AuditDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "cloudshield-dlq-${Environment}"
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - { Key: Project, Value: CloudShield }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # -------------------------------------------------------------------------
+  # Secrets Manager — store API keys off Lambda env vars
+  # -------------------------------------------------------------------------
+  CloudShieldSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "/cloudshield/${Environment}/secrets"
+      Description: "CloudShield webhook URLs and API keys"
+      SecretString: !Sub |
+        {
+          "slack_webhook_url":    "${SlackWebhookUrl}",
+          "api_key":              "${ApiKey}",
+          "slack_signing_secret": "${SlackSigningSecret}"
+        }
+      Tags:
+        - { Key: Project, Value: CloudShield }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # -------------------------------------------------------------------------
+  # Cognito — user pool + SPA client + hosted UI domain
+  # -------------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "cloudshield-users-${Environment}"
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+      Tags:
+        Project: CloudShield
+        Environment: !Ref Environment
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "cloudshield-spa-${Environment}"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - !Sub "https://${DashboardDistribution.DomainName}/callback"
+        - "http://localhost:5173/callback"
+        - "http://localhost:4173/callback"
+      LogoutURLs:
+        - !Sub "https://${DashboardDistribution.DomainName}"
+        - "http://localhost:5173"
+        - "http://localhost:4173"
+      SupportedIdentityProviders: [COGNITO]
+      PreventUserExistenceErrors: ENABLED
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "cloudshield-${Environment}-${AWS::AccountId}"
+      UserPoolId: !Ref UserPool
+
+  # -------------------------------------------------------------------------
+  # DynamoDB — audit trail (separate table so it doesn't pollute the hot scan)
+  # -------------------------------------------------------------------------
+  AuditLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "cloudshield-audit-log-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - { AttributeName: violation_id, AttributeType: S }
+        - { AttributeName: timestamp,    AttributeType: S }
+      KeySchema:
+        - { AttributeName: violation_id, KeyType: HASH }
+        - { AttributeName: timestamp,    KeyType: RANGE }
       Tags:
         - { Key: Project, Value: CloudShield }
         - { Key: Environment, Value: !Ref Environment }
@@ -157,6 +268,23 @@ Resources:
                 Resource:
                   - !GetAtt ViolationsTable.Arn
                   - !Sub "${ViolationsTable.Arn}/index/*"
+                  - !GetAtt AuditLogTable.Arn
+                  - !Sub "${AuditLogTable.Arn}/index/*"
+              - Sid: SecretsRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref CloudShieldSecrets
+              - Sid: AssumeCrossAccountAuditRole
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: "arn:aws:iam::*:role/CloudShieldAuditRole*"
+              - Sid: DLQSend
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt AuditDLQ.Arn
               - Sid: CloudWatchMetrics
                 Effect: Allow
                 Action:
@@ -189,6 +317,13 @@ Resources:
       Handler: src.handler.lambda_handler
       Role: !GetAtt AuditorExecutionRole.Arn
       Description: "Evaluates live cloud resources against security policies"
+      ReservedConcurrentExecutions: 1  # single-flight: scheduled + manual triggers can't interleave resolve-diff
+      Environment:
+        Variables:
+          AUDIT_TARGETS: !Ref AuditTargetAccounts
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt AuditDLQ.Arn
       Events:
         ScheduledAudit:
           Type: ScheduleV2
@@ -196,6 +331,8 @@ Resources:
             ScheduleExpression: !Ref AuditScheduleExpression
             ScheduleExpressionTimezone: UTC
             State: ENABLED
+            DeadLetterConfig:
+              Arn: !GetAtt AuditDLQ.Arn
       Tags:
         Project: CloudShield
         Environment: !Ref Environment
@@ -216,6 +353,11 @@ Resources:
           API_KEY:               !Ref ApiKey
           SLACK_SIGNING_SECRET:  !Ref SlackSigningSecret
           AUDITOR_FUNCTION_NAME: !Sub "cloudshield-auditor-${Environment}"
+          COGNITO_ISSUER:        !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+          COGNITO_CLIENT_ID:     !Ref UserPoolClient
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt AuditDLQ.Arn
       Events:
         ApiRoot:
           Type: HttpApi
@@ -236,8 +378,9 @@ Resources:
           - !Sub "https://${DashboardDistribution.DomainName}"
           - "http://localhost:3000"
           - "http://localhost:4173"
+          - "http://localhost:5173"
         AllowMethods: ["GET", "POST", "PATCH", "OPTIONS"]
-        AllowHeaders: ["Content-Type", "X-Api-Key"]
+        AllowHeaders: ["Content-Type", "X-Api-Key", "Authorization"]
 
   # -------------------------------------------------------------------------
   # Weekly digest Lambda — fires every Monday 08:00 UTC
@@ -254,6 +397,9 @@ Resources:
         Variables:
           DIGEST_TO_EMAIL:   !Ref DigestToEmail
           DIGEST_FROM_EMAIL: !Ref DigestFromEmail
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt AuditDLQ.Arn
       Events:
         WeeklySchedule:
           Type: ScheduleV2
@@ -261,6 +407,8 @@ Resources:
             ScheduleExpression: "cron(0 8 ? * MON *)"
             ScheduleExpressionTimezone: UTC
             State: !If [DigestEnabled, ENABLED, DISABLED]
+            DeadLetterConfig:
+              Arn: !GetAtt AuditDLQ.Arn
       Tags:
         Project: CloudShield
         Environment: !Ref Environment
@@ -444,3 +592,22 @@ Outputs:
 
   AlertTopicArn:
     Value: !Ref AuditAlertTopic
+
+  CognitoUserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref UserPool
+
+  CognitoClientId:
+    Description: "Set as VITE_COGNITO_CLIENT_ID in the dashboard build"
+    Value: !Ref UserPoolClient
+
+  CognitoDomain:
+    Description: "Hosted UI domain — set as VITE_COGNITO_DOMAIN (without https://)"
+    Value: !Sub "cloudshield-${Environment}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com"
+
+  AuditLogTableName:
+    Value: !Ref AuditLogTable
+
+  DeadLetterQueueUrl:
+    Description: "SQS DLQ for failed audit runs"
+    Value: !Ref AuditDLQ

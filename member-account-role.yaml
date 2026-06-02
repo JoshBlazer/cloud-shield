@@ -1,0 +1,83 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudShield member-account read-only role. Deploy this in every account you
+  want the central CloudShield auditor to scan. It grants the central account
+  permission to assume a role that can only read security posture — no writes.
+
+Parameters:
+  CentralAccountId:
+    Type: String
+    Description: "AWS account ID where the CloudShield auditor Lambda runs"
+    AllowedPattern: "^[0-9]{12}$"
+
+  ExternalId:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: "Optional ExternalId to harden the trust policy against confused-deputy"
+
+Conditions:
+  HasExternalId: !Not [!Equals [!Ref ExternalId, ""]]
+
+Resources:
+  CloudShieldAuditRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # Name must start with CloudShieldAuditRole to match the central role's
+      # sts:AssumeRole resource pattern (arn:aws:iam::*:role/CloudShieldAuditRole*)
+      RoleName: CloudShieldAuditRole
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${CentralAccountId}:root"
+            Action: sts:AssumeRole
+            Condition: !If
+              - HasExternalId
+              - StringEquals:
+                  sts:ExternalId: !Ref ExternalId
+              - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: CloudShieldReadOnlyAudit
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3ReadAccess
+                Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:GetEncryptionConfiguration
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketTagging
+                  - s3:GetBucketPolicy
+                Resource: "*"
+              - Sid: EC2ReadAccess
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeTags
+                  - ec2:DescribeRegions
+                Resource: "*"
+              - Sid: IAMReadAccess
+                Effect: Allow
+                Action:
+                  - iam:ListUsers
+                  - iam:GetLoginProfile
+                  - iam:ListMFADevices
+                  - iam:ListAccessKeys
+                  - iam:GetAccountPasswordPolicy
+                  - iam:ListUserTags
+                  - iam:GetAccountSummary
+                  - iam:GenerateCredentialReport
+                  - iam:GetCredentialReport
+                Resource: "*"
+      Tags:
+        - { Key: Project, Value: CloudShield }
+
+Outputs:
+  RoleArn:
+    Description: "Add this ARN to AuditTargetAccounts on the central stack"
+    Value: !GetAtt CloudShieldAuditRole.Arn

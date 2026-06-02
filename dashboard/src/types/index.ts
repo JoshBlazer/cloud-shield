@@ -24,6 +24,16 @@ export interface Violation {
   account_id:       string
 }
 
+export interface AuditEvent {
+  violation_id: string
+  timestamp:    string
+  action:       string
+  actor:        string
+  from_status:  string
+  to_status:    string
+  context:      string
+}
+
 export interface Summary {
   total:       number
   by_status:   Record<string, number>
@@ -32,6 +42,6 @@ export interface Summary {
 }
 
 export interface AuditTriggerResult {
-  resources_audited: number
-  violations_found:  number
+  triggered: boolean
+  message:   string
 }

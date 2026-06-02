@@ -88,11 +88,32 @@ API_ENDPOINT ?= $(shell aws cloudformation describe-stacks \
 	--query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" \
 	--output text 2>/dev/null)
 
+COGNITO_DOMAIN ?= $(shell aws cloudformation describe-stacks \
+	--stack-name cloudshield-auditor-production \
+	--query "Stacks[0].Outputs[?OutputKey=='CognitoDomain'].OutputValue" \
+	--output text 2>/dev/null)
+
+COGNITO_CLIENT_ID ?= $(shell aws cloudformation describe-stacks \
+	--stack-name cloudshield-auditor-production \
+	--query "Stacks[0].Outputs[?OutputKey=='CognitoClientId'].OutputValue" \
+	--output text 2>/dev/null)
+
+DASHBOARD_URL ?= $(shell aws cloudformation describe-stacks \
+	--stack-name cloudshield-auditor-production \
+	--query "Stacks[0].Outputs[?OutputKey=='DashboardUrl'].OutputValue" \
+	--output text 2>/dev/null)
+
 dashboard-dev: ## Run dashboard dev server (mock API)
 	cd dashboard && npm run dev
 
-dashboard-build: ## Build dashboard for production (set VITE_API_URL first)
-	cd dashboard && VITE_USE_MOCK=false VITE_API_URL=$(API_ENDPOINT) npm run build
+dashboard-build: ## Build dashboard for production (pulls API + Cognito config from stack outputs)
+	cd dashboard && \
+	  VITE_USE_MOCK=false \
+	  VITE_API_URL=$(API_ENDPOINT) \
+	  VITE_COGNITO_DOMAIN=$(COGNITO_DOMAIN) \
+	  VITE_COGNITO_CLIENT_ID=$(COGNITO_CLIENT_ID) \
+	  VITE_APP_URL=$(DASHBOARD_URL) \
+	  npm run build
 
 dashboard-deploy: dashboard-build ## Build and sync dashboard to S3
 	@test -n "$(DASHBOARD_BUCKET)" || (echo "ERROR: DASHBOARD_BUCKET not set and could not read from stack"; exit 1)
