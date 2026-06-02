@@ -1,0 +1,116 @@
+name: CI/CD — CloudShield Auditor
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write   # required for OIDC token exchange
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: "3.12"
+  SAM_CLI_TELEMETRY: 0
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint & type-check (runs on every push and PR)
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff lint
+        run: ruff check src/ tests/
+
+      - name: Mypy type check
+        run: mypy src/ --ignore-missing-imports
+
+  # ---------------------------------------------------------------------------
+  # Test suite with Moto (fake AWS)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run pytest
+        run: pytest tests/ -v --tb=short --cov=src --cov-report=term-missing
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+
+  # ---------------------------------------------------------------------------
+  # Deploy to AWS via OIDC (only on main branch merges)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy (SAM)
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # No static keys — GitHub requests a short-lived token from AWS STS
+          # via the OIDC provider. The token is valid only for this workflow run.
+
+      - name: Install Lambda dependencies
+        run: pip install -r requirements.txt -t .aws-sam/deps/python
+
+      - name: SAM build
+        run: sam build --use-container
+
+      - name: SAM deploy
+        run: |
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --stack-name cloudshield-auditor-production \
+            --region ${{ env.AWS_REGION }} \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              SlackWebhookUrl=${{ secrets.SLACK_WEBHOOK_URL }} \
+              Environment=production

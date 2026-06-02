@@ -1,0 +1,26 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name     = "cloudshield-auditor-production"
+region         = "us-east-1"
+confirm_changeset    = false
+fail_on_empty_changeset = false
+capabilities   = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+
+[default.build.parameters]
+use_container = true
+
+[default.deploy.parameters]
+# SlackWebhookUrl is intentionally omitted — supply it at deploy time:
+#   make deploy SLACK_WEBHOOK_URL=https://hooks.slack.com/...
+# or set it as a GitHub secret (AWS_DEPLOY_ROLE_ARN, SLACK_WEBHOOK_URL).
+parameter_overrides = "Environment=production"
+
+[default.logs.parameters]
+name   = "cloudshield-auditor-production"
+region = "us-east-1"
+
+[default.delete.parameters]
+stack_name = "cloudshield-auditor-production"
+region     = "us-east-1"
+no_prompts = false

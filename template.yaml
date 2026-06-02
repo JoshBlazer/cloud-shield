@@ -1,0 +1,419 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: CloudShield-Auditor — event-driven infrastructure drift and compliance auditor
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - arm64
+    Timeout: 300
+    MemorySize: 256
+    Environment:
+      Variables:
+        SNS_TOPIC_ARN:           !Ref AuditAlertTopic
+        CLOUDWATCH_NAMESPACE:    CloudShield/Auditor
+        AWS_ACCOUNT_ID:          !Ref AWS::AccountId
+        VIOLATIONS_TABLE:        !Ref ViolationsTable
+        DASHBOARD_URL:           !Sub "https://${DashboardDistribution.DomainName}"
+        SLACK_WEBHOOK_URL:       !Ref SlackWebhookUrl
+
+Parameters:
+  SlackWebhookUrl:
+    Type: String
+    NoEcho: true
+    Description: "Slack incoming webhook URL (Block Kit alerts)"
+
+  DigestToEmail:
+    Type: String
+    Default: ""
+    Description: "Email address for weekly SES digest (leave empty to disable)"
+
+  DigestFromEmail:
+    Type: String
+    Default: "cloudshield-noreply@example.com"
+    Description: "Verified SES sender address for the weekly digest"
+
+  AuditScheduleExpression:
+    Type: String
+    Default: "rate(1 hour)"
+    Description: "EventBridge schedule for the audit Lambda"
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging, development]
+
+Resources:
+  # -------------------------------------------------------------------------
+  # DynamoDB — violation store
+  # -------------------------------------------------------------------------
+  ViolationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "cloudshield-violations-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: pk,           AttributeType: S }
+        - { AttributeName: violation_id, AttributeType: S }
+        - { AttributeName: status,       AttributeType: S }
+        - { AttributeName: team,         AttributeType: S }
+        - { AttributeName: last_seen,    AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: violation-id-index
+          KeySchema:
+            - { AttributeName: violation_id, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+        - IndexName: status-index
+          KeySchema:
+            - { AttributeName: status,    KeyType: HASH }
+            - { AttributeName: last_seen, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: team-index
+          KeySchema:
+            - { AttributeName: team,      KeyType: HASH }
+            - { AttributeName: last_seen, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      Tags:
+        - { Key: Project, Value: CloudShield }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # -------------------------------------------------------------------------
+  # IAM — shared least-privilege execution role
+  # -------------------------------------------------------------------------
+  AuditorExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cloudshield-auditor-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudShieldAuditorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3ReadAccess
+                Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:GetEncryptionConfiguration
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketTagging
+                Resource: "*"
+              - Sid: EC2ReadAccess
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeTags
+                Resource: "*"
+              - Sid: IAMReadAccess
+                Effect: Allow
+                Action:
+                  - iam:ListUsers
+                  - iam:GetLoginProfile
+                  - iam:ListMFADevices
+                  - iam:ListAccessKeys
+                  - iam:GetAccountPasswordPolicy
+                  - iam:ListUserTags
+                Resource: "*"
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ViolationsTable.Arn
+                  - !Sub "${ViolationsTable.Arn}/index/*"
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AuditAlertTopic
+              - Sid: SESDigest
+                Effect: Allow
+                Action:
+                  - ses:SendEmail
+                Resource: "*"
+
+  # -------------------------------------------------------------------------
+  # Audit Lambda — scheduled hourly
+  # -------------------------------------------------------------------------
+  AuditorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cloudshield-auditor-${Environment}"
+      CodeUri: .
+      Handler: src.handler.lambda_handler
+      Role: !GetAtt AuditorExecutionRole.Arn
+      Description: "Evaluates live cloud resources against security policies"
+      Events:
+        ScheduledAudit:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: !Ref AuditScheduleExpression
+            ScheduleExpressionTimezone: UTC
+            State: ENABLED
+      Tags:
+        Project: CloudShield
+        Environment: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # API Lambda + HTTP API Gateway
+  # -------------------------------------------------------------------------
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cloudshield-api-${Environment}"
+      CodeUri: .
+      Handler: src.api.handler.api_handler
+      Role: !GetAtt AuditorExecutionRole.Arn
+      Description: "REST API for the CloudShield dashboard"
+      Events:
+        ApiRoot:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+      Tags:
+        Project: CloudShield
+        Environment: !Ref Environment
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub "https://${DashboardDistribution.DomainName}"
+          - "http://localhost:3000"
+          - "http://localhost:4173"
+        AllowMethods: ["GET", "POST", "PATCH", "OPTIONS"]
+        AllowHeaders: ["Content-Type", "X-Api-Key"]
+
+  # -------------------------------------------------------------------------
+  # Weekly digest Lambda — fires every Monday 08:00 UTC
+  # -------------------------------------------------------------------------
+  DigestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cloudshield-digest-${Environment}"
+      CodeUri: .
+      Handler: src.notifications.digest.digest_handler
+      Role: !GetAtt AuditorExecutionRole.Arn
+      Description: "Sends the weekly SES compliance summary email"
+      Environment:
+        Variables:
+          DIGEST_TO_EMAIL:   !Ref DigestToEmail
+          DIGEST_FROM_EMAIL: !Ref DigestFromEmail
+      Events:
+        WeeklySchedule:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(0 8 ? * MON *)"
+            ScheduleExpressionTimezone: UTC
+            State: !If [DigestEnabled, ENABLED, DISABLED]
+      Tags:
+        Project: CloudShield
+        Environment: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # SNS — email fan-out
+  # -------------------------------------------------------------------------
+  AuditAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "cloudshield-alerts-${Environment}"
+      DisplayName: "CloudShield Security Alerts"
+
+  # -------------------------------------------------------------------------
+  # S3 + CloudFront — dashboard hosting
+  # -------------------------------------------------------------------------
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "cloudshield-dashboard-${Environment}-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls:       true
+        IgnorePublicAcls:      true
+        BlockPublicPolicy:     true
+        RestrictPublicBuckets: true
+
+  DashboardBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${DashboardBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${DashboardDistribution}"
+
+  DashboardOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "cloudshield-oac-${Environment}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  DashboardDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt DashboardBucket.RegionalDomainName
+            OriginAccessControlId: !Ref DashboardOAC
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized managed policy
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Dashboard
+  # -------------------------------------------------------------------------
+  AuditorDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "cloudshield-auditor-${Environment}"
+      DashboardBody: >
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 8, "height": 6,
+              "properties": {
+                "title": "Active Security Violations",
+                "metrics": [["CloudShield/Auditor", "ViolationsFound"]],
+                "stat": "Sum", "period": 3600, "view": "singleValue", "setPeriodToTimeRange": true
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 0, "width": 8, "height": 6,
+              "properties": {
+                "title": "Total Resources Audited",
+                "metrics": [["CloudShield/Auditor", "ResourcesAudited"]],
+                "stat": "Sum", "period": 3600, "view": "singleValue", "setPeriodToTimeRange": true
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 0, "width": 8, "height": 6,
+              "properties": {
+                "title": "Avg Audit Duration (ms)",
+                "metrics": [["CloudShield/Auditor", "AuditDurationMs"]],
+                "stat": "Average", "period": 3600, "view": "singleValue", "setPeriodToTimeRange": true
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 24, "height": 6,
+              "properties": {
+                "title": "Violations Over Time",
+                "metrics": [
+                  ["CloudShield/Auditor", "ViolationsFound",  {"label": "Violations",         "color": "#d62728"}],
+                  ["CloudShield/Auditor", "ResourcesAudited", {"label": "Resources Audited",   "color": "#1f77b4"}]
+                ],
+                "stat": "Sum", "period": 3600, "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Alarms
+  # -------------------------------------------------------------------------
+  CriticalViolationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:        !Sub "cloudshield-critical-violations-${Environment}"
+      AlarmDescription: "Fires when any security violations are detected"
+      Namespace:        CloudShield/Auditor
+      MetricName:       ViolationsFound
+      Statistic:        Sum
+      Period:           3600
+      EvaluationPeriods: 1
+      Threshold:        1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:     [!Ref AuditAlertTopic]
+      TreatMissingData: notBreaching
+
+  AuditFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:        !Sub "cloudshield-lambda-errors-${Environment}"
+      AlarmDescription: "Fires when the auditor Lambda errors out"
+      Namespace:        AWS/Lambda
+      MetricName:       Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AuditorFunction
+      Statistic:        Sum
+      Period:           300
+      EvaluationPeriods: 1
+      Threshold:        1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:     [!Ref AuditAlertTopic]
+      TreatMissingData: notBreaching
+
+Conditions:
+  DigestEnabled: !Not [!Equals [!Ref DigestToEmail, ""]]
+
+Outputs:
+  AuditorFunctionArn:
+    Value: !GetAtt AuditorFunction.Arn
+
+  ApiEndpoint:
+    Description: "API Gateway endpoint — set as VITE_API_URL in the dashboard build"
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+
+  DashboardUrl:
+    Description: "CloudFront URL for the React dashboard"
+    Value: !Sub "https://${DashboardDistribution.DomainName}"
+
+  DashboardBucketName:
+    Description: "S3 bucket — deploy the dashboard build here"
+    Value: !Ref DashboardBucket
+
+  ViolationsTableName:
+    Value: !Ref ViolationsTable
+
+  AlertTopicArn:
+    Value: !Ref AuditAlertTopic

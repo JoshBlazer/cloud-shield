@@ -1,0 +1,77 @@
+version: "1.0"
+description: "CloudShield security policy ruleset"
+
+rules:
+  s3:
+    - id: S3_001
+      name: "No Public S3 Buckets"
+      severity: CRITICAL
+      check: public_access_block_disabled
+      description: "S3 bucket must have all public access block settings enabled"
+
+    - id: S3_002
+      name: "S3 Server-Side Encryption Required"
+      severity: HIGH
+      check: encryption_disabled
+      description: "S3 bucket must have default server-side encryption configured"
+
+    - id: S3_003
+      name: "S3 Versioning Required"
+      severity: MEDIUM
+      check: versioning_disabled
+      description: "S3 bucket must have versioning enabled to support recovery"
+
+  iam:
+    - id: IAM_001
+      name: "MFA Required for Console Users"
+      severity: CRITICAL
+      check: mfa_not_enabled
+      description: "All IAM users with console access must have an MFA device configured"
+
+    - id: IAM_002
+      name: "Access Key Rotation Required"
+      severity: HIGH
+      check: access_key_not_rotated
+      max_age_days: 90
+      description: "Active IAM access keys must be rotated at least every 90 days"
+
+    - id: IAM_003
+      name: "Weak Account Password Policy"
+      severity: HIGH
+      check: weak_password_policy
+      min_length: 14
+      require_uppercase: true
+      require_lowercase: true
+      require_numbers: true
+      require_symbols: true
+      max_age_days: 90
+      prevent_reuse: 5
+      description: "Account password policy must enforce complexity, rotation, and reuse prevention"
+
+  ec2:
+    - id: EC2_001
+      name: "No Unrestricted SSH Access"
+      severity: CRITICAL
+      check: unrestricted_ingress
+      port: 22
+      description: "Security group must not allow SSH (port 22) from 0.0.0.0/0 or ::/0"
+
+    - id: EC2_002
+      name: "No Unrestricted RDP Access"
+      severity: CRITICAL
+      check: unrestricted_ingress
+      port: 3389
+      description: "Security group must not allow RDP (port 3389) from 0.0.0.0/0 or ::/0"
+
+    - id: EC2_003
+      name: "No Unrestricted All Traffic"
+      severity: CRITICAL
+      check: unrestricted_all_traffic
+      description: "Security group must not allow all traffic (-1) from any source"
+
+    - id: EC2_004
+      name: "No Unrestricted HTTP Access"
+      severity: MEDIUM
+      check: unrestricted_ingress
+      port: 80
+      description: "Security group should not allow HTTP (port 80) from 0.0.0.0/0"

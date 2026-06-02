@@ -1,0 +1,377 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_CLOUDWATCH",
+      "label": "CloudWatch",
+      "description": "AWS CloudWatch data source",
+      "type": "datasource",
+      "pluginId": "cloudwatch",
+      "pluginName": "CloudWatch"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "10.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "cloudwatch",
+      "name": "CloudWatch",
+      "version": "1.0.0"
+    },
+    {
+      "type": "panel",
+      "id": "stat",
+      "name": "Stat",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "timeseries",
+      "name": "Time series",
+      "version": ""
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "CloudShield-Auditor — infrastructure drift and compliance telemetry",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": { "0": { "color": "green", "index": 0, "text": "Clean" } },
+              "type": "value"
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "alias": "Violations",
+          "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+          "dimensions": {},
+          "expression": "",
+          "id": "violations",
+          "matchExact": true,
+          "metricEditorMode": 0,
+          "metricName": "ViolationsFound",
+          "metricQueryType": 0,
+          "namespace": "CloudShield/Auditor",
+          "period": "3600",
+          "queryMode": "Metrics",
+          "refId": "A",
+          "region": "${region}",
+          "statistic": "Sum"
+        }
+      ],
+      "title": "Active Security Violations",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "alias": "Resources",
+          "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+          "dimensions": {},
+          "metricName": "ResourcesAudited",
+          "namespace": "CloudShield/Auditor",
+          "period": "3600",
+          "queryMode": "Metrics",
+          "refId": "A",
+          "region": "${region}",
+          "statistic": "Sum"
+        }
+      ],
+      "title": "Total Resources Audited",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 5000 },
+              { "color": "red", "value": 15000 }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "alias": "Duration",
+          "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+          "dimensions": {},
+          "metricName": "AuditDurationMs",
+          "namespace": "CloudShield/Auditor",
+          "period": "3600",
+          "queryMode": "Metrics",
+          "refId": "A",
+          "region": "${region}",
+          "statistic": "Average"
+        }
+      ],
+      "title": "Avg Audit Duration",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Violations" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "#d62728", "mode": "fixed" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Resources Audited" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "#1f77b4", "mode": "fixed" } }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 6 },
+      "id": 4,
+      "options": {
+        "legend": { "calcs": ["sum", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "alias": "Violations",
+          "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+          "dimensions": {},
+          "metricName": "ViolationsFound",
+          "namespace": "CloudShield/Auditor",
+          "period": "3600",
+          "queryMode": "Metrics",
+          "refId": "A",
+          "region": "${region}",
+          "statistic": "Sum"
+        },
+        {
+          "alias": "Resources Audited",
+          "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+          "dimensions": {},
+          "metricName": "ResourcesAudited",
+          "namespace": "CloudShield/Auditor",
+          "period": "3600",
+          "queryMode": "Metrics",
+          "refId": "B",
+          "region": "${region}",
+          "statistic": "Sum"
+        }
+      ],
+      "title": "Violations vs Resources Audited Over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 14 },
+      "id": 5,
+      "options": {
+        "legend": { "calcs": ["mean", "max", "p99"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "alias": "Average",
+          "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+          "dimensions": {},
+          "metricName": "AuditDurationMs",
+          "namespace": "CloudShield/Auditor",
+          "period": "3600",
+          "queryMode": "Metrics",
+          "refId": "A",
+          "region": "${region}",
+          "statistic": "Average"
+        },
+        {
+          "alias": "p99",
+          "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+          "dimensions": {},
+          "metricName": "AuditDurationMs",
+          "namespace": "CloudShield/Auditor",
+          "period": "3600",
+          "queryMode": "Metrics",
+          "refId": "B",
+          "region": "${region}",
+          "statistic": "p99"
+        }
+      ],
+      "title": "Audit Duration — Average vs p99 (ms)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 39,
+  "tags": ["cloudshield", "security", "aws", "compliance"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "cloudwatch",
+        "refresh": 1,
+        "type": "datasource",
+        "label": "CloudWatch Data Source"
+      },
+      {
+        "current": { "selected": false, "text": "us-east-1", "value": "us-east-1" },
+        "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
+        "definition": "regions()",
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "name": "region",
+        "options": [],
+        "query": "regions()",
+        "refresh": 1,
+        "type": "query",
+        "label": "AWS Region"
+      }
+    ]
+  },
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "CloudShield Auditor",
+  "uid": "cloudshield-auditor-v1",
+  "version": 1
+}

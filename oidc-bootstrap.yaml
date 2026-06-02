@@ -1,0 +1,165 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  One-time OIDC trust setup for CloudShield GitHub Actions deployment.
+  Run once per AWS account. The output ARN goes into GitHub Secrets as
+  AWS_DEPLOY_ROLE_ARN.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: "GitHub organization or username (e.g. acme-corp)"
+
+  GitHubRepo:
+    Type: String
+    Default: "cloudshield-auditor"
+    Description: "Repository name — must match the repo that runs Actions"
+
+  GitHubBranch:
+    Type: String
+    Default: "main"
+    Description: "Branch allowed to assume the deploy role"
+
+Resources:
+  # -------------------------------------------------------------------------
+  # OIDC provider — tells AWS to trust tokens issued by GitHub Actions
+  # -------------------------------------------------------------------------
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: "https://token.actions.githubusercontent.com"
+      ClientIdList:
+        - "sts.amazonaws.com"
+      # GitHub's current OIDC thumbprint. Verify at:
+      # https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc_verify-thumbprint.html
+      ThumbprintList:
+        - "6938fd4d98bab03faadb97b34396831e3780aea1"
+
+  # -------------------------------------------------------------------------
+  # Deployment role — assumed by GitHub Actions via the OIDC token
+  # -------------------------------------------------------------------------
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "cloudshield-github-deploy-role"
+      Description: "Short-lived role assumed by GitHub Actions to deploy CloudShield"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !GetAtt GitHubOIDCProvider.Arn
+            Action: "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+              # Scope to a specific branch — never a wildcard on a deploy role
+              StringEquals:
+                "token.actions.githubusercontent.com:sub":
+                  !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}"
+      Policies:
+        - PolicyName: CloudShieldSAMDeployPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # SAM uses S3 to stage artefacts
+              - Sid: SAMBucketAccess
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource: "*"
+
+              # CloudFormation stack management
+              - Sid: CloudFormationAccess
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListStackResources
+                Resource: "*"
+
+              # Lambda deployment
+              - Sid: LambdaAccess
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:PublishVersion
+                  - lambda:TagResource
+                  - lambda:ListTags
+                Resource: "*"
+
+              # IAM role management scoped to CloudShield roles only
+              - Sid: IAMRoleManagement
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cloudshield-*"
+
+              # SNS, EventBridge, CloudWatch
+              - Sid: ObservabilityAndMessaging
+                Effect: Allow
+                Action:
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:GetTopicAttributes
+                  - sns:SetTopicAttributes
+                  - sns:Subscribe
+                  - sns:Unsubscribe
+                  - events:PutRule
+                  - events:DeleteRule
+                  - events:DescribeRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                  - scheduler:CreateSchedule
+                  - scheduler:UpdateSchedule
+                  - scheduler:DeleteSchedule
+                  - scheduler:GetSchedule
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:DeleteDashboards
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                Resource: "*"
+
+Outputs:
+  DeployRoleArn:
+    Description: >
+      Copy this ARN into GitHub repository Settings → Secrets and variables →
+      Actions → New repository secret → Name: AWS_DEPLOY_ROLE_ARN
+    Value: !GetAtt GitHubDeployRole.Arn
+
+  OIDCProviderArn:
+    Description: "ARN of the GitHub OIDC provider (for reference)"
+    Value: !GetAtt GitHubOIDCProvider.Arn

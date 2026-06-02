@@ -1,0 +1,33 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root {
+    @apply h-full bg-bg text-text;
+  }
+  * {
+    box-sizing: border-box;
+  }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #434343; border-radius: 3px; }
+}
+
+@layer components {
+  .card {
+    @apply bg-surface border border-border rounded-lg overflow-hidden
+           transition-colors duration-150 hover:border-[#434343];
+  }
+  .btn {
+    @apply px-3 py-1.5 rounded text-xs font-semibold transition-colors duration-150
+           cursor-pointer border border-transparent;
+  }
+  .btn-primary   { @apply bg-critical/20 text-critical border-critical/40 hover:bg-critical/30; }
+  .btn-secondary { @apply bg-border text-subtle hover:bg-[#303030] hover:text-text; }
+  .btn-ghost     { @apply text-subtle hover:text-text hover:bg-border; }
+  .badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold
+           tracking-widest uppercase;
+  }
+}
