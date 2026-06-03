@@ -280,3 +280,61 @@ class TestReads:
         assert summary["by_status"]["OPEN"] == 2
         assert summary["by_status"]["ACKNOWLEDGED"] == 1
         assert summary["by_team"]["infra"]["OPEN"] == 2
+
+
+# ── active-pk write sharding ────────────────────────────────────────────────────
+
+class TestSharding:
+    def test_active_pk_is_sharded_not_bare_status(self, ddb_session, sample_violation):
+        """active_pk must be 'STATUS#shard', never the bare status (the hot-partition bug)."""
+        item, _ = store.upsert_violation(ddb_session, sample_violation)
+        raw = ddb_session.resource("dynamodb").Table("cloudshield-violations").get_item(
+            Key={"pk": item["pk"]}
+        )["Item"]
+        assert raw["active_pk"] != "OPEN"
+        assert raw["active_pk"].startswith("OPEN#")
+        shard = int(raw["active_pk"].split("#")[1])
+        assert 0 <= shard < store.SHARD_COUNT
+
+    def test_items_spread_across_multiple_shards(self, ddb_session):
+        """A realistic set of OPEN items should not all collapse to one partition."""
+        for i in range(40):
+            store.upsert_violation(ddb_session, {
+                "rule_id": "EC2_001", "rule_name": "SSH", "severity": "CRITICAL",
+                "resource_type": "AWS::EC2::SecurityGroup", "resource_id": f"sg-{i:04d}",
+                "reason": "open", "team": "infra",
+            })
+        table = ddb_session.resource("dynamodb").Table("cloudshield-violations")
+        shard_keys = {
+            table.get_item(Key={"pk": f"EC2_001#sg-{i:04d}"})["Item"]["active_pk"]
+            for i in range(40)
+        }
+        # With 40 items and SHARD_COUNT shards we expect several distinct partitions
+        assert len(shard_keys) > 1
+        assert len(shard_keys) <= store.SHARD_COUNT
+
+    def test_sharded_query_still_finds_all(self, ddb_session):
+        """Fan-out query must return every item despite them living on different shards."""
+        for i in range(40):
+            store.upsert_violation(ddb_session, {
+                "rule_id": "EC2_001", "rule_name": "SSH", "severity": "CRITICAL",
+                "resource_type": "AWS::EC2::SecurityGroup", "resource_id": f"sg-{i:04d}",
+                "reason": "open", "team": "infra",
+            })
+        open_items = store.list_violations(ddb_session, status="OPEN", limit=500)
+        assert len(open_items) == 40
+        assert len(store.get_active_pks(ddb_session)) == 40
+
+    def test_shard_stable_across_status_changes(self, ddb_session, sample_violation):
+        """The shard number stays fixed as a violation moves OPEN -> ACK -> SNOOZED."""
+        item, _ = store.upsert_violation(ddb_session, sample_violation)
+        vid = item["violation_id"]
+        expected = store._shard(item["pk"])
+
+        store.acknowledge(ddb_session, vid)
+        raw = store.get_by_id(ddb_session, vid)
+        assert raw["active_pk"] == f"ACKNOWLEDGED#{expected}"
+
+        store.snooze(ddb_session, vid, days=7)
+        raw = store.get_by_id(ddb_session, vid)
+        assert raw["active_pk"] == f"SNOOZED#{expected}"

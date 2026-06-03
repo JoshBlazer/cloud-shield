@@ -577,6 +577,24 @@ Resources:
       AlarmActions:     [!Ref AuditAlertTopic]
       TreatMissingData: notBreaching
 
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:        !Sub "cloudshield-dlq-messages-${Environment}"
+      AlarmDescription: "A Lambda invocation or schedule failed and landed in the DLQ — investigate and replay"
+      Namespace:        AWS/SQS
+      MetricName:       ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AuditDLQ.QueueName
+      Statistic:        Maximum
+      Period:           300
+      EvaluationPeriods: 1
+      Threshold:        1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:     [!Ref AuditAlertTopic]
+      TreatMissingData: notBreaching
+
 Conditions:
   DigestEnabled: !Not [!Equals [!Ref DigestToEmail, ""]]
 

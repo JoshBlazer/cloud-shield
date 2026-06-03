@@ -3,6 +3,7 @@
 import os
 import time
 import uuid
+import zlib
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -24,6 +25,13 @@ STATUS_EXEMPTED     = "EXEMPTED"
 
 ACTIVE_STATUSES = {STATUS_OPEN, STATUS_ACKNOWLEDGED, STATUS_SNOOZED}
 
+# active-pk-index write sharding. The GSI hash key is f"{status}#{shard}" so a
+# single dominant status (e.g. OPEN) is spread across SHARD_COUNT partitions
+# instead of hammering one. Queries fan out over all shards and merge.
+# Fixed at deploy time — changing it requires re-sharding existing items, since
+# the shard is derived from the (stable) pk and only rewritten on status change.
+SHARD_COUNT = max(1, int(os.environ.get("ACTIVE_PK_SHARDS", "10")))
+
 
 def _now() -> str:
     return datetime.now(tz=UTC).isoformat()
@@ -39,6 +47,21 @@ def _pk(rule_id: str, resource_id: str) -> str:
 
 def _stable_id(rule_id: str, resource_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_OID, f"{rule_id}#{resource_id}"))
+
+
+def _shard(pk: str) -> int:
+    """Deterministic shard for a pk — same violation always lands on the same shard."""
+    return zlib.crc32(pk.encode()) % SHARD_COUNT
+
+
+def _active_pk(status: str, pk: str) -> str:
+    """High-cardinality GSI hash key: spreads a status across SHARD_COUNT partitions."""
+    return f"{status}#{_shard(pk)}"
+
+
+def _active_pk_shards(status: str) -> list[str]:
+    """All shard keys for a status — used to fan out queries."""
+    return [f"{status}#{i}" for i in range(SHARD_COUNT)]
 
 
 # ── Write operations ──────────────────────────────────────────────────────────
@@ -57,9 +80,10 @@ def upsert_violation(
     3. Unconditional overwrite — reached only when item is RESOLVED (regression).
        Returns is_new=True so the caller re-alerts.
 
-    active_pk mirrors status for ACTIVE items and is absent for RESOLVED/EXEMPTED.
-    This makes active-pk-index a sparse index — RESOLVED items are off the index entirely,
-    preventing the hot-partition problem of all OPEN items sharing one GSI partition.
+    active_pk is f"{status}#{shard}" for ACTIVE items and absent for RESOLVED/EXEMPTED.
+    The index is therefore both sparse (RESOLVED/EXEMPTED items are off it entirely)
+    and sharded (each status is spread across SHARD_COUNT partitions), so a dominant
+    status like OPEN no longer hammers a single GSI partition.
     """
     table      = _table(session)
     rule_id    = violation["rule_id"]
@@ -77,7 +101,7 @@ def upsert_violation(
         "resource_id":      resource_id,
         "reason":           violation["reason"],
         "status":           STATUS_OPEN,
-        "active_pk":        STATUS_OPEN,  # sparse index key — present only on active items
+        "active_pk":        _active_pk(STATUS_OPEN, pk),  # sharded sparse-index key
         "first_detected":   now,
         "last_seen":        now,
         "occurrence_count": 1,
@@ -128,9 +152,14 @@ def acknowledge(session: Any, violation_id: str, by: str = "user") -> bool:
     now = _now()
     _table(session).update_item(
         Key={"pk": item["pk"]},
-        UpdateExpression="SET #s=:acked, acknowledged_by=:by, acknowledged_at=:at, active_pk=:acked",
+        UpdateExpression="SET #s=:acked, acknowledged_by=:by, acknowledged_at=:at, active_pk=:apk",
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":acked": STATUS_ACKNOWLEDGED, ":by": by, ":at": now},
+        ExpressionAttributeValues={
+            ":acked": STATUS_ACKNOWLEDGED,
+            ":by": by,
+            ":at": now,
+            ":apk": _active_pk(STATUS_ACKNOWLEDGED, item["pk"]),
+        },
     )
     audit_log.log_transition(
         session,
@@ -151,9 +180,13 @@ def snooze(session: Any, violation_id: str, days: int = 7) -> bool:
     until = (datetime.now(tz=UTC) + timedelta(days=days)).isoformat()
     _table(session).update_item(
         Key={"pk": item["pk"]},
-        UpdateExpression="SET #s=:snoozed, snooze_until=:u, active_pk=:snoozed",
+        UpdateExpression="SET #s=:snoozed, snooze_until=:u, active_pk=:apk",
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":snoozed": STATUS_SNOOZED, ":u": until},
+        ExpressionAttributeValues={
+            ":snoozed": STATUS_SNOOZED,
+            ":u": until,
+            ":apk": _active_pk(STATUS_SNOOZED, item["pk"]),
+        },
     )
     audit_log.log_transition(
         session,
@@ -219,45 +252,50 @@ def mark_resolved(session: Any, pk: str) -> None:
 
 
 def wake_snoozed_violations(session: Any) -> int:
-    """Re-open any SNOOZED violations whose snooze_until has passed."""
+    """Re-open any SNOOZED violations whose snooze_until has passed. Fans out over shards."""
     table = _table(session)
     now   = _now()
     woken = 0
 
-    kwargs: dict[str, Any] = {
-        "IndexName": "active-pk-index",
-        "KeyConditionExpression": Key("active_pk").eq(STATUS_SNOOZED),
-        "FilterExpression": Attr("snooze_until").lt(now),
-        "ProjectionExpression": "pk, violation_id",
-    }
-    while True:
-        resp = table.query(**kwargs)
-        for item in resp.get("Items", []):
-            try:
-                table.update_item(
-                    Key={"pk": item["pk"]},
-                    UpdateExpression="SET #s = :open, active_pk = :open, snooze_until = :null",
-                    ExpressionAttributeNames={"#s": "status"},
-                    ExpressionAttributeValues={":open": STATUS_OPEN, ":null": None},
-                    ConditionExpression=Attr("status").eq(STATUS_SNOOZED),
-                )
-                woken += 1
-                if item.get("violation_id"):
-                    audit_log.log_transition(
-                        session,
-                        violation_id=item["violation_id"],
-                        action="wake",
-                        actor="auditor",
-                        from_status=STATUS_SNOOZED,
-                        to_status=STATUS_OPEN,
+    for shard_key in _active_pk_shards(STATUS_SNOOZED):
+        kwargs: dict[str, Any] = {
+            "IndexName": "active-pk-index",
+            "KeyConditionExpression": Key("active_pk").eq(shard_key),
+            "FilterExpression": Attr("snooze_until").lt(now),
+            "ProjectionExpression": "pk, violation_id",
+        }
+        while True:
+            resp = table.query(**kwargs)
+            for item in resp.get("Items", []):
+                try:
+                    table.update_item(
+                        Key={"pk": item["pk"]},
+                        UpdateExpression="SET #s = :open, active_pk = :apk, snooze_until = :null",
+                        ExpressionAttributeNames={"#s": "status"},
+                        ExpressionAttributeValues={
+                            ":open": STATUS_OPEN,
+                            ":apk": _active_pk(STATUS_OPEN, item["pk"]),
+                            ":null": None,
+                        },
+                        ConditionExpression=Attr("status").eq(STATUS_SNOOZED),
                     )
-                log.info("store.woken", pk=item["pk"])
-            except ClientError as exc:
-                if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
-                    raise
-        if "LastEvaluatedKey" not in resp:
-            break
-        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+                    woken += 1
+                    if item.get("violation_id"):
+                        audit_log.log_transition(
+                            session,
+                            violation_id=item["violation_id"],
+                            action="wake",
+                            actor="auditor",
+                            from_status=STATUS_SNOOZED,
+                            to_status=STATUS_OPEN,
+                        )
+                    log.info("store.woken", pk=item["pk"])
+                except ClientError as exc:
+                    if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                        raise
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
 
     return woken
 
@@ -296,19 +334,22 @@ def list_violations(
         items = resp.get("Items", [])
 
     elif status in ACTIVE_STATUSES:
-        # active-pk-index: sparse — RESOLVED/EXEMPTED items are not here
-        kwargs = {
-            "IndexName": "active-pk-index",
-            "KeyConditionExpression": Key("active_pk").eq(status),
-        }
-        if severity:
-            kwargs["FilterExpression"] = Attr("severity").eq(severity)
-        while True:
-            resp = table.query(**kwargs)
-            items.extend(resp.get("Items", []))
-            if "LastEvaluatedKey" not in resp or len(items) >= limit:
+        # active-pk-index: sparse + sharded. Fan out over all shards for this status.
+        for shard_key in _active_pk_shards(status):
+            kwargs = {
+                "IndexName": "active-pk-index",
+                "KeyConditionExpression": Key("active_pk").eq(shard_key),
+            }
+            if severity:
+                kwargs["FilterExpression"] = Attr("severity").eq(severity)
+            while True:
+                resp = table.query(**kwargs)
+                items.extend(resp.get("Items", []))
+                if "LastEvaluatedKey" not in resp or len(items) >= limit:
+                    break
+                kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+            if len(items) >= limit:
                 break
-            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
         items = items[:limit]
 
     elif status:
@@ -341,21 +382,22 @@ def list_violations(
 
 
 def get_active_pks(session: Any) -> set[str]:
-    """Return all PKs in an active status, paginated. Uses sparse active-pk-index."""
+    """Return all PKs in an active status. Fans out over sharded active-pk-index, paginated."""
     pks: set[str] = set()
     table = _table(session)
     for s in ACTIVE_STATUSES:
-        kwargs: dict[str, Any] = {
-            "IndexName": "active-pk-index",
-            "KeyConditionExpression": Key("active_pk").eq(s),
-            "ProjectionExpression": "pk",
-        }
-        while True:
-            resp = table.query(**kwargs)
-            pks.update(item["pk"] for item in resp.get("Items", []))
-            if "LastEvaluatedKey" not in resp:
-                break
-            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        for shard_key in _active_pk_shards(s):
+            kwargs: dict[str, Any] = {
+                "IndexName": "active-pk-index",
+                "KeyConditionExpression": Key("active_pk").eq(shard_key),
+                "ProjectionExpression": "pk",
+            }
+            while True:
+                resp = table.query(**kwargs)
+                pks.update(item["pk"] for item in resp.get("Items", []))
+                if "LastEvaluatedKey" not in resp:
+                    break
+                kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
     return pks
 
 
