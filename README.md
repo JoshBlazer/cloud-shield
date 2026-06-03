@@ -124,7 +124,7 @@ Lifecycle transitions are available via the dashboard UI, Slack buttons, or `PAT
 
 Two layers, picked per caller:
 
-- **Dashboard users** sign in through a Cognito hosted UI (OAuth2 + PKCE, no client secret). The SPA holds the resulting token in memory only (never localStorage) and sends it as `Authorization: Bearer <jwt>`. The API validates the signature against the Cognito JWKS, checks the `iss` claim equals the expected issuer, and confirms the client by `token_use`: ID tokens must have `aud == client_id`, access tokens must have `client_id == client_id` (Cognito access tokens carry no `aud`). This solves the "static SPA can't hold a secret" problem — there's no long-lived key in the bundle.
+- **Dashboard users** sign in through a Cognito hosted UI (OAuth2 + PKCE, no client secret). The SPA holds the resulting token in memory only (never localStorage) and sends it as `Authorization: Bearer <jwt>`. The API validates the signature against the Cognito JWKS, checks the `iss` claim equals the expected issuer, and confirms the client by `token_use`: ID tokens must have `aud == client_id`, access tokens must have `client_id == client_id` (Cognito access tokens carry no `aud`). The JWKS is cached with a 1-hour TTL and force-refreshed when a token's `kid` isn't in the cache, so Cognito signing-key rotation is picked up without recycling the container. This solves the "static SPA can't hold a secret" problem — there's no long-lived key in the bundle.
 - **Machine-to-machine** callers (CI, scripts) send `X-Api-Key: <key>`, checked in constant time.
 
 When neither an API key nor `COGNITO_ISSUER` is configured (local dev), auth passes through.

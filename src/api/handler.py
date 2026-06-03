@@ -32,8 +32,11 @@ _ALLOWED_ORIGINS: set[str] = {
     ) if o
 }
 
-# Module-level JWKS cache — persists across warm invocations
+# Module-level JWKS cache — persists across warm invocations, refreshed on a TTL
+# so a long-lived container picks up Cognito signing-key rotation.
 _JWKS_CACHE: dict = {}
+_JWKS_FETCHED_AT: float = 0.0
+_JWKS_TTL = 3600  # seconds
 
 
 # ── Event parsing ─────────────────────────────────────────────────────────────
@@ -51,14 +54,17 @@ def _parse_event(event: dict) -> tuple[str, str, dict[str, str]]:
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
-def _load_jwks() -> dict:
-    global _JWKS_CACHE
-    if _JWKS_CACHE:
+def _load_jwks(force: bool = False) -> dict:
+    """Fetch the Cognito JWKS, cached with a TTL. force=True bypasses the cache."""
+    global _JWKS_CACHE, _JWKS_FETCHED_AT
+    now = time.time()
+    if not force and _JWKS_CACHE and (now - _JWKS_FETCHED_AT) < _JWKS_TTL:
         return _JWKS_CACHE
     import urllib.request
     url = f"{_COGNITO_ISSUER}/.well-known/jwks.json"
     with urllib.request.urlopen(url, timeout=5) as r:  # noqa: S310
         _JWKS_CACHE = json.loads(r.read())
+        _JWKS_FETCHED_AT = now
     return _JWKS_CACHE
 
 
@@ -67,7 +73,14 @@ def _verify_jwt(token: str) -> bool:
         return False
     try:
         from jose import jwt as jose_jwt
+
+        # If the token's signing key isn't in the cached JWKS, force a refresh —
+        # this is how key rotation is picked up before the TTL elapses.
+        kid  = jose_jwt.get_unverified_header(token).get("kid")
         jwks = _load_jwks()
+        if kid and kid not in {k.get("kid") for k in jwks.get("keys", [])}:
+            jwks = _load_jwks(force=True)
+
         # Validate signature + issuer here. Cognito ACCESS tokens have no `aud`
         # claim (they carry `client_id`), so audience is checked per token_use
         # below rather than via jose's audience= (which assumes an `aud` claim).

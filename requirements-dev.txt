@@ -1,7 +1,7 @@
 -r requirements.txt
 pytest>=8.0.0
 pytest-cov>=5.0.0
-moto[s3,ec2,iam,dynamodb,sns,cloudwatch]>=5.0.0
+moto[s3,ec2,iam,dynamodb,sns,cloudwatch,secretsmanager,sqs]>=5.0.0
 responses>=0.25.0
 ruff>=0.4.0
 mypy>=1.10.0
