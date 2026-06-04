@@ -144,7 +144,8 @@ class IAMAuditor(BaseAuditor):
 
     def _get_password_policy(self) -> dict[str, Any]:
         try:
-            return self._client.get_account_password_policy().get("PasswordPolicy", {})
+            policy: dict[str, Any] = self._client.get_account_password_policy().get("PasswordPolicy", {})
+            return policy
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "NoSuchEntity":
                 return {}

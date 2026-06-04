@@ -37,7 +37,7 @@ def _now() -> str:
     return datetime.now(tz=UTC).isoformat()
 
 
-def _table(session: Any):
+def _table(session: Any) -> Any:
     return session.resource("dynamodb").Table(TABLE_NAME)
 
 

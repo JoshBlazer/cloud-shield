@@ -24,7 +24,7 @@ class S3Auditor(BaseAuditor):
             log.error("s3.list_buckets failed", error=str(exc))
             return []
 
-        def _fetch_one(bucket: dict) -> dict[str, Any]:
+        def _fetch_one(bucket: dict[str, Any]) -> dict[str, Any]:
             name = bucket["Name"]
             tags = self._get_tags(name)
             return {
@@ -51,7 +51,8 @@ class S3Auditor(BaseAuditor):
     def _get_public_access_block(self, bucket_name: str) -> dict[str, bool]:
         try:
             resp = self._client.get_public_access_block(Bucket=bucket_name)
-            return resp["PublicAccessBlockConfiguration"]
+            pab: dict[str, bool] = resp["PublicAccessBlockConfiguration"]
+            return pab
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration":
                 return {}
@@ -61,7 +62,8 @@ class S3Auditor(BaseAuditor):
     def _get_encryption(self, bucket_name: str) -> dict[str, Any]:
         try:
             resp = self._client.get_bucket_encryption(Bucket=bucket_name)
-            return resp.get("ServerSideEncryptionConfiguration", {})
+            enc: dict[str, Any] = resp.get("ServerSideEncryptionConfiguration", {})
+            return enc
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "ServerSideEncryptionConfigurationNotFoundError":
                 return {}
@@ -71,7 +73,8 @@ class S3Auditor(BaseAuditor):
     def _get_versioning(self, bucket_name: str) -> str:
         try:
             resp = self._client.get_bucket_versioning(Bucket=bucket_name)
-            return resp.get("Status", "Disabled")
+            status: str = resp.get("Status", "Disabled")
+            return status
         except ClientError as exc:
             log.warning("s3.get_bucket_versioning failed", bucket=bucket_name, error=str(exc))
             return "Disabled"

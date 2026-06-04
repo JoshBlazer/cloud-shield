@@ -21,7 +21,7 @@ _EMOJI = {
 }
 
 
-def _blocks_for_violation(v: dict[str, Any]) -> list[dict]:
+def _blocks_for_violation(v: dict[str, Any]) -> list[dict[str, Any]]:
     vid   = v.get("violation_id", v.get("pk", ""))
     sev   = v["severity"]
     emoji = _EMOJI.get(sev, ":white_circle:")
@@ -79,7 +79,7 @@ def _blocks_for_violation(v: dict[str, Any]) -> list[dict]:
     ]
 
 
-def _post(payload: dict) -> None:
+def _post(payload: dict[str, Any]) -> None:
     webhook = secrets.get_secret("slack_webhook_url")
     if not webhook:
         log.warning("slack.webhook_not_configured")
@@ -98,7 +98,7 @@ def send_new_violations(violations: list[dict[str, Any]]) -> None:
 
     for i in range(0, len(violations), 5):
         batch = violations[i : i + 5]
-        blocks: list[dict] = [
+        blocks: list[dict[str, Any]] = [
             {
                 "type": "header",
                 "text": {

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable
 from typing import Any
 
 import boto3
@@ -34,14 +35,14 @@ _ALLOWED_ORIGINS: set[str] = {
 
 # Module-level JWKS cache — persists across warm invocations, refreshed on a TTL
 # so a long-lived container picks up Cognito signing-key rotation.
-_JWKS_CACHE: dict = {}
+_JWKS_CACHE: dict[str, Any] = {}
 _JWKS_FETCHED_AT: float = 0.0
 _JWKS_TTL = 3600  # seconds
 
 
 # ── Event parsing ─────────────────────────────────────────────────────────────
 
-def _parse_event(event: dict) -> tuple[str, str, dict[str, str]]:
+def _parse_event(event: dict[str, Any]) -> tuple[str, str, dict[str, str]]:
     """Support payload format 1.0 (httpMethod/path) and 2.0 (requestContext.http/rawPath)."""
     rc       = event.get("requestContext", {})
     http_ctx = rc.get("http", {})
@@ -54,7 +55,7 @@ def _parse_event(event: dict) -> tuple[str, str, dict[str, str]]:
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
-def _load_jwks(force: bool = False) -> dict:
+def _load_jwks(force: bool = False) -> dict[str, Any]:
     """Fetch the Cognito JWKS, cached with a TTL. force=True bypasses the cache."""
     global _JWKS_CACHE, _JWKS_FETCHED_AT
     now = time.time()
@@ -92,9 +93,9 @@ def _verify_jwt(token: str) -> bool:
         )
         token_use = claims.get("token_use")
         if token_use == "id":
-            return claims.get("aud") == _COGNITO_CLIENT_ID
+            return bool(claims.get("aud") == _COGNITO_CLIENT_ID)
         if token_use == "access":
-            return claims.get("client_id") == _COGNITO_CLIENT_ID
+            return bool(claims.get("client_id") == _COGNITO_CLIENT_ID)
         return False
     except Exception:  # noqa: BLE001
         return False
@@ -119,7 +120,7 @@ def _is_authorized(headers: dict[str, str]) -> bool:
     return not (api_key or _COGNITO_ISSUER)
 
 
-def _verify_slack_signature(event: dict, headers: dict[str, str]) -> bool:
+def _verify_slack_signature(event: dict[str, Any], headers: dict[str, str]) -> bool:
     signing_secret = secrets.get_secret("slack_signing_secret")
     if not signing_secret:
         return True
@@ -149,7 +150,7 @@ def _cors(origin: str) -> dict[str, str]:
     }
 
 
-def _ok(body: Any, status: int = 200, origin: str = "") -> dict:
+def _ok(body: Any, status: int = 200, origin: str = "") -> dict[str, Any]:
     return {
         "statusCode": status,
         "headers": {**_cors(origin), "Content-Type": "application/json"},
@@ -157,7 +158,7 @@ def _ok(body: Any, status: int = 200, origin: str = "") -> dict:
     }
 
 
-def _err(msg: str, status: int = 400, origin: str = "") -> dict:
+def _err(msg: str, status: int = 400, origin: str = "") -> dict[str, Any]:
     return {
         "statusCode": status,
         "headers": {**_cors(origin), "Content-Type": "application/json"},
@@ -171,7 +172,7 @@ def _session() -> Any:
 
 # ── Route handlers ────────────────────────────────────────────────────────────
 
-def _list_violations(event: dict, **_: Any) -> dict:
+def _list_violations(event: dict[str, Any], **_: Any) -> dict[str, Any]:
     qs = event.get("queryStringParameters") or {}
     try:
         limit = max(1, min(500, int(qs.get("limit", 200))))
@@ -187,7 +188,7 @@ def _list_violations(event: dict, **_: Any) -> dict:
     return _ok({"violations": items, "count": len(items)}, origin=event.get("_origin", ""))
 
 
-def _get_violation(event: dict, violation_id: str) -> dict:
+def _get_violation(event: dict[str, Any], violation_id: str) -> dict[str, Any]:
     origin = event.get("_origin", "")
     item   = store.get_by_id(_session(), violation_id)
     if not item:
@@ -195,13 +196,13 @@ def _get_violation(event: dict, violation_id: str) -> dict:
     return _ok(item, origin=origin)
 
 
-def _get_violation_history(event: dict, violation_id: str) -> dict:
+def _get_violation_history(event: dict[str, Any], violation_id: str) -> dict[str, Any]:
     origin = event.get("_origin", "")
     events = audit_log.get_history(_session(), violation_id)
     return _ok({"violation_id": violation_id, "events": events}, origin=origin)
 
 
-def _patch_violation(event: dict, violation_id: str) -> dict:
+def _patch_violation(event: dict[str, Any], violation_id: str) -> dict[str, Any]:
     origin = event.get("_origin", "")
     try:
         body = json.loads(event.get("body") or "{}")
@@ -225,11 +226,11 @@ def _patch_violation(event: dict, violation_id: str) -> dict:
     return _ok({"ok": True, "action": action, "violation_id": violation_id}, origin=origin)
 
 
-def _get_summary(event: dict, **_: Any) -> dict:
+def _get_summary(event: dict[str, Any], **_: Any) -> dict[str, Any]:
     return _ok(store.get_summary(_session()), origin=event.get("_origin", ""))
 
 
-def _trigger_audit(event: dict, **_: Any) -> dict:
+def _trigger_audit(event: dict[str, Any], **_: Any) -> dict[str, Any]:
     origin = event.get("_origin", "")
     if not _AUDITOR_FUNCTION:
         return _err("AUDITOR_FUNCTION_NAME not configured", 500, origin=origin)
@@ -241,7 +242,7 @@ def _trigger_audit(event: dict, **_: Any) -> dict:
     return _ok({"triggered": True, "message": "Audit queued"}, 202, origin=origin)
 
 
-def _slack_interact(event: dict, headers: dict[str, str]) -> dict:
+def _slack_interact(event: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
     import urllib.parse
     if not _verify_slack_signature(event, headers):
         return _err("invalid Slack signature", 401)
@@ -266,7 +267,7 @@ def _slack_interact(event: dict, headers: dict[str, str]) -> dict:
 
 # ── Router ────────────────────────────────────────────────────────────────────
 
-_ROUTES: list[tuple[str, str, Any]] = [
+_ROUTES: list[tuple[str, str, Callable[..., dict[str, Any]]]] = [
     ("GET",   r"^/violations$",                         _list_violations),
     # history before bare /{id} so the more specific pattern wins
     ("GET",   r"^/violations/(?P<id>[^/]+)/history$",   _get_violation_history),

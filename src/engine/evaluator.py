@@ -2,6 +2,7 @@
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -9,6 +10,7 @@ import boto3
 import structlog
 import yaml
 
+from src.auditors.base_auditor import BaseAuditor
 from src.auditors.ec2_auditor import EC2Auditor
 from src.auditors.iam_auditor import IAMAuditor
 from src.auditors.s3_auditor import S3Auditor
@@ -17,7 +19,10 @@ log = structlog.get_logger()
 
 _POLICY_PATH = Path(__file__).parent.parent.parent / "policies.yaml"
 
-_AUDITOR_MAP = {
+# Concrete auditor factories keyed by service. Typed as a Callable (not type[...])
+# so mypy treats each as a factory returning a BaseAuditor rather than an
+# attempt to instantiate the abstract base.
+_AUDITOR_MAP: dict[str, Callable[[Any], BaseAuditor]] = {
     "s3":  S3Auditor,
     "ec2": EC2Auditor,
     "iam": IAMAuditor,
@@ -31,7 +36,8 @@ class AuditResult(TypedDict):
 
 def _load_policies(path: Path = _POLICY_PATH) -> dict[str, Any]:
     with open(path) as fh:
-        return yaml.safe_load(fh)
+        data: dict[str, Any] = yaml.safe_load(fh)
+        return data
 
 
 def _assume_role_session(base_session: Any, role_arn: str, account_id: str, region: str) -> Any:

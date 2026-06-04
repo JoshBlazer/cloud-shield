@@ -48,6 +48,8 @@ class EC2Auditor(BaseAuditor):
 
                 if check == "unrestricted_ingress":
                     target_port = rule.get("port")
+                    if target_port is None:
+                        continue
                     found = self._has_unrestricted_port(ingress_rules, target_port)
                     if found:
                         violations.append(
@@ -98,10 +100,10 @@ class EC2Auditor(BaseAuditor):
     def _get_open_cidr(perm: dict[str, Any]) -> str:
         for ip_range in perm.get("IpRanges", []):
             if ip_range.get("CidrIp") in _OPEN_CIDRS:
-                return ip_range["CidrIp"]
+                return str(ip_range["CidrIp"])
         for ip_range in perm.get("Ipv6Ranges", []):
             if ip_range.get("CidrIpv6") in _OPEN_CIDRS:
-                return ip_range["CidrIpv6"]
+                return str(ip_range["CidrIpv6"])
         return ""
 
     @staticmethod

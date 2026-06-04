@@ -16,7 +16,7 @@ def _now() -> str:
     return datetime.now(tz=UTC).isoformat()
 
 
-def _table(session: Any):
+def _table(session: Any) -> Any:
     return session.resource("dynamodb").Table(TABLE_NAME)
 
 
@@ -53,4 +53,5 @@ def get_history(session: Any, violation_id: str, limit: int = 50) -> list[dict[s
         ScanIndexForward=False,
         Limit=limit,
     )
-    return resp.get("Items", [])
+    items: list[dict[str, Any]] = resp.get("Items", [])
+    return items
