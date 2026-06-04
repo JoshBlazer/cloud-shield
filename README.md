@@ -146,7 +146,7 @@ With no targets set, the auditor scans its own account and region.
 | `AuditScheduleExpression` | `rate(1 hour)` | How often the auditor runs. |
 | `Environment` | `production` | Suffix applied to all resource names. |
 
-CI/CD: a push to `main` lints, runs the test suite, then deploys via OIDC. No static keys live in GitHub secrets. See `.github/workflows/deploy.yml`.
+CI/CD: every push and PR runs lint, type-check, and the test suite. The deploy job is opt-in and stays skipped until you set the `AWS_DEPLOY_ROLE_ARN` repository variable (from `make bootstrap`) and the `SLACK_WEBHOOK_URL` secret, so a fresh clone shows green on the checks that don't need an AWS account. When enabled, a push to `main` deploys via OIDC with no static keys. See `.github/workflows/deploy.yml`.
 
 ## Local development and testing
 

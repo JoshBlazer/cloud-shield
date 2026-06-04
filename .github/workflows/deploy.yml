@@ -67,13 +67,22 @@ jobs:
           AWS_SECRET_ACCESS_KEY: testing
 
   # ---------------------------------------------------------------------------
-  # Deploy to AWS via OIDC (only on main branch merges)
+  # Deploy to AWS via OIDC (opt-in: only when a deploy role is configured)
+  #
+  # Skipped by default so a fork without AWS wired up stays green on lint+test.
+  # To enable: run `make bootstrap`, then set the repository variable
+  # AWS_DEPLOY_ROLE_ARN to the OIDC role ARN and the secret SLACK_WEBHOOK_URL.
+  # (Role ARNs are not sensitive, so this lives in vars — which, unlike secrets,
+  # can gate a job-level `if:`.)
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy (SAM)
     runs-on: ubuntu-latest
     needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      vars.AWS_DEPLOY_ROLE_ARN != ''
     environment: production
 
     steps:
@@ -92,9 +101,9 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          # No static keys — GitHub requests a short-lived token from AWS STS
+          # No static keys: GitHub requests a short-lived token from AWS STS
           # via the OIDC provider. The token is valid only for this workflow run.
 
       - name: Install Lambda dependencies
