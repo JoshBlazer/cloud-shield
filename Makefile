@@ -9,7 +9,7 @@ SLACK_WEBHOOK_URL ?= REPLACE_ME
 
 .PHONY: help install lint format type-check test test-cov \
         validate build deploy-guided deploy logs destroy bootstrap clean \
-        dashboard-dev local-api dashboard-dev-real
+        dashboard-dev local-api dashboard-dev-real validate-offline release member-role
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -45,8 +45,11 @@ test-cov: ## Run tests with HTML + terminal coverage report
 
 # ── SAM / AWS ─────────────────────────────────────────────────────────────
 
-validate: ## Validate the SAM template
+validate: ## Validate the SAM template (needs the SAM CLI and AWS credentials)
 	$(SAM) validate --template template.yaml --lint
+
+validate-offline: ## Validate all templates offline: SAM transform + cfn-lint (no AWS needed)
+	$(PYTHON) scripts/validate_templates.py
 
 build: ## Build the Lambda deployment package
 	$(SAM) build
@@ -122,10 +125,32 @@ dashboard-build: ## Build dashboard for production (pulls API + Cognito config f
 	  VITE_APP_URL=$(DASHBOARD_URL) \
 	  npm run build
 
-dashboard-deploy: dashboard-build ## Build and sync dashboard to S3
+DASHBOARD_DISTRIBUTION ?= $(shell aws cloudformation describe-stacks 	--stack-name cloudshield-auditor-production 	--query "Stacks[0].Outputs[?OutputKey=='DashboardDistributionId'].OutputValue" 	--output text 2>/dev/null)
+
+# Order matters. Content-hashed assets go up first with a long immutable cache and
+# are never deleted here, so browsers still holding the previous index.html keep
+# working. index.html goes last with no-cache, then CloudFront is invalidated so the
+# new version is served at once (the CachingOptimized policy would otherwise keep
+# the old index.html for up to a day — pointing at assets that no longer exist).
+dashboard-deploy: dashboard-build ## Build and publish the dashboard to S3 + CloudFront
 	@test -n "$(DASHBOARD_BUCKET)" || (echo "ERROR: DASHBOARD_BUCKET not set and could not read from stack"; exit 1)
-	aws s3 sync dashboard/dist/ s3://$(DASHBOARD_BUCKET)/ --delete
+	aws s3 sync dashboard/dist/assets/ s3://$(DASHBOARD_BUCKET)/assets/ 	  --cache-control "public, max-age=31536000, immutable"
+	aws s3 sync dashboard/dist/ s3://$(DASHBOARD_BUCKET)/ --exclude "assets/*" --exclude "index.html" 	  --cache-control "public, max-age=300"
+	aws s3 cp dashboard/dist/index.html s3://$(DASHBOARD_BUCKET)/index.html 	  --cache-control "no-cache" --content-type "text/html; charset=utf-8"
+	@if [ -n "$(DASHBOARD_DISTRIBUTION)" ]; then 	  aws cloudfront create-invalidation --distribution-id $(DASHBOARD_DISTRIBUTION) --paths "/index.html" "/" >/dev/null && 	  echo "Invalidated /index.html on $(DASHBOARD_DISTRIBUTION)"; 	else echo "WARNING: DashboardDistributionId output not found; skipped CloudFront invalidation"; fi
 	@echo "Dashboard deployed to s3://$(DASHBOARD_BUCKET)"
+
+# The dashboard's Undo/Reopen, trend chart and severity breakdown need the new API,
+# so the backend always goes first. The second step runs in a fresh make so the
+# stack outputs (bucket, API URL, Cognito) are read after the deploy, not before.
+release: deploy ## Deploy backend, then dashboard, in that order
+	$(MAKE) dashboard-deploy
+
+# Run with credentials for the MEMBER account being scanned. For an AWS
+# Organization, update the StackSet instead (see README "Cross-account scanning").
+member-role: ## Deploy/update the read-only CloudShieldAuditRole in the current account
+	@test -n "$(CENTRAL_ACCOUNT_ID)" || (echo "ERROR: set CENTRAL_ACCOUNT_ID=<12-digit central account id>"; exit 1)
+	aws cloudformation deploy 	  --template-file member-account-role.yaml 	  --stack-name cloudshield-member-role 	  --capabilities CAPABILITY_NAMED_IAM 	  --no-fail-on-empty-changeset 	  --parameter-overrides CentralAccountId=$(CENTRAL_ACCOUNT_ID) $(if $(EXTERNAL_ID),ExternalId=$(EXTERNAL_ID),)
 
 # ── Housekeeping ─────────────────────────────────────────────────────────────
 

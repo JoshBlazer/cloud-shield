@@ -51,10 +51,11 @@ Resources:
               Federated: !GetAtt GitHubOIDCProvider.Arn
             Action: "sts:AssumeRoleWithWebIdentity"
             Condition:
+              # Both keys must sit under ONE StringEquals: a second StringEquals
+              # key silently replaced the first, dropping the audience check.
               StringEquals:
                 "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-              # Scope to a specific branch — never a wildcard on a deploy role
-              StringEquals:
+                # Scope to a specific branch — never a wildcard on a deploy role
                 "token.actions.githubusercontent.com:sub":
                   !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}"
       Policies:
