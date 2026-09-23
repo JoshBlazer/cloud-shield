@@ -7,6 +7,7 @@ import os
 import re
 import time
 from collections.abc import Callable
+from decimal import Decimal
 from typing import Any
 
 import boto3
@@ -150,11 +151,18 @@ def _cors(origin: str) -> dict[str, str]:
     }
 
 
+def _json_default(obj: Any) -> Any:
+    """DynamoDB Decimals become int (integral) or float; anything else falls back to str."""
+    if isinstance(obj, Decimal):
+        return int(obj) if obj == obj.to_integral_value() else float(obj)
+    return str(obj)
+
+
 def _ok(body: Any, status: int = 200, origin: str = "") -> dict[str, Any]:
     return {
         "statusCode": status,
         "headers": {**_cors(origin), "Content-Type": "application/json"},
-        "body": json.dumps(body, default=str),
+        "body": json.dumps(body, default=_json_default),
     }
 
 
@@ -226,6 +234,13 @@ def _patch_violation(event: dict[str, Any], violation_id: str) -> dict[str, Any]
         ok = store.snooze(session, violation_id, days=int(body.get("days", 7)))
     elif action == "exempt":
         ok = store.exempt(session, violation_id, reason=body.get("reason", ""))
+    elif action == "reopen":
+        # 404 only when the id doesn't exist; a non-reopenable status is a 409.
+        if not store.get_by_id(session, violation_id):
+            return _err("violation not found", 404, origin=origin)
+        if not store.reopen(session, violation_id, by=body.get("by", "dashboard-user")):
+            return _err("violation cannot be reopened", 409, origin=origin)
+        ok = True
     else:
         return _err(f"unknown action '{action}'", origin=origin)
 
@@ -236,6 +251,16 @@ def _patch_violation(event: dict[str, Any], violation_id: str) -> dict[str, Any]
 
 def _get_summary(event: dict[str, Any], **_: Any) -> dict[str, Any]:
     return _ok(store.get_summary(_session()), origin=event.get("_origin", ""))
+
+
+def _get_trend(event: dict[str, Any], **_: Any) -> dict[str, Any]:
+    origin = event.get("_origin", "")
+    qs     = event.get("queryStringParameters") or {}
+    try:
+        days = max(1, min(store.TREND_MAX_DAYS, int(qs.get("days", 14))))
+    except (ValueError, TypeError):
+        return _err("invalid days", origin=origin)
+    return _ok({"days": store.get_trend(_session(), days)}, origin=origin)
 
 
 def _trigger_audit(event: dict[str, Any], **_: Any) -> dict[str, Any]:
@@ -282,6 +307,7 @@ _ROUTES: list[tuple[str, str, Callable[..., dict[str, Any]]]] = [
     ("GET",   r"^/violations/(?P<id>[^/]+)$",           _get_violation),
     ("PATCH", r"^/violations/(?P<id>[^/]+)$",           _patch_violation),
     ("GET",   r"^/summary$",                            _get_summary),
+    ("GET",   r"^/trend$",                              _get_trend),
     ("POST",  r"^/audit/trigger$",                      _trigger_audit),
     ("POST",  r"^/slack/interact$",                     _slack_interact),
 ]

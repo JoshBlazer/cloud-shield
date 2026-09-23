@@ -26,7 +26,10 @@ STATUS_SNOOZED      = "SNOOZED"
 STATUS_RESOLVED     = "RESOLVED"
 STATUS_EXEMPTED     = "EXEMPTED"
 
-ACTIVE_STATUSES = {STATUS_OPEN, STATUS_ACKNOWLEDGED, STATUS_SNOOZED}
+ACTIVE_STATUSES     = {STATUS_OPEN, STATUS_ACKNOWLEDGED, STATUS_SNOOZED}
+REOPENABLE_STATUSES = {STATUS_ACKNOWLEDGED, STATUS_SNOOZED, STATUS_EXEMPTED}
+
+SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 
 # active-pk-index write sharding. The GSI hash key is f"{status}#{shard}" so a
 # single dominant status (e.g. OPEN) is spread across SHARD_COUNT partitions
@@ -44,6 +47,15 @@ SHARD_COUNT = max(1, int(os.environ.get("ACTIVE_PK_SHARDS", "10")))
 SUMMARY_TABLE         = os.environ.get("SUMMARY_TABLE", "cloudshield-summary")
 SUMMARY_PK            = "global"
 SUMMARY_REBUILD_HOURS = float(os.environ.get("SUMMARY_REBUILD_HOURS", "24"))
+# Bumped whenever a counter family is added: an aggregate built by an older
+# schema lacks the new family, so reconcile rebuilds it regardless of age.
+SUMMARY_SCHEMA        = 2
+# Non-counter attributes on the aggregate item.
+_SUMMARY_META         = ("pk", "rebuilt_at", "schema")
+
+# Daily trend snapshots share the summary table, one item per UTC date.
+TREND_PK_PREFIX = "trend#"
+TREND_MAX_DAYS  = 90
 
 
 def _now() -> str:
@@ -89,10 +101,13 @@ def _created_deltas(severity: str, team: str) -> dict[str, int]:
         f"sev#{severity}": 1,
         f"status#{STATUS_OPEN}": 1,
         f"team#{team}#{STATUS_OPEN}": 1,
+        f"sevstatus#{severity}#{STATUS_OPEN}": 1,
     }
 
 
-def _transition_deltas(team: str, from_status: str, to_status: str) -> dict[str, int]:
+def _transition_deltas(
+    team: str, severity: str, from_status: str, to_status: str,
+) -> dict[str, int]:
     if from_status == to_status:
         return {}
     return {
@@ -100,6 +115,8 @@ def _transition_deltas(team: str, from_status: str, to_status: str) -> dict[str,
         f"status#{to_status}": 1,
         f"team#{team}#{from_status}": -1,
         f"team#{team}#{to_status}": 1,
+        f"sevstatus#{severity}#{from_status}": -1,
+        f"sevstatus#{severity}#{to_status}": 1,
     }
 
 
@@ -200,7 +217,9 @@ def upsert_violation(
 
     # Phase 3: was RESOLVED — regression, create fresh OPEN item
     table.put_item(Item=new_item)
-    _bump_summary(session, _transition_deltas(new_item["team"], STATUS_RESOLVED, STATUS_OPEN))
+    _bump_summary(session, _transition_deltas(
+        new_item["team"], new_item["severity"], STATUS_RESOLVED, STATUS_OPEN,
+    ))
     log.info("store.regression", pk=pk)
     return new_item, True
 
@@ -222,7 +241,8 @@ def acknowledge(session: Any, violation_id: str, by: str = "user") -> bool:
         },
     )
     _bump_summary(session, _transition_deltas(
-        item.get("team", "untagged"), item.get("status", STATUS_OPEN), STATUS_ACKNOWLEDGED,
+        item.get("team", "untagged"), item.get("severity", "UNKNOWN"),
+        item.get("status", STATUS_OPEN), STATUS_ACKNOWLEDGED,
     ))
     audit_log.log_transition(
         session,
@@ -252,7 +272,8 @@ def snooze(session: Any, violation_id: str, days: int = 7) -> bool:
         },
     )
     _bump_summary(session, _transition_deltas(
-        item.get("team", "untagged"), item.get("status", STATUS_OPEN), STATUS_SNOOZED,
+        item.get("team", "untagged"), item.get("severity", "UNKNOWN"),
+        item.get("status", STATUS_OPEN), STATUS_SNOOZED,
     ))
     audit_log.log_transition(
         session,
@@ -278,7 +299,8 @@ def exempt(session: Any, violation_id: str, reason: str = "") -> bool:
         ExpressionAttributeValues={":ex": STATUS_EXEMPTED, ":r": reason},
     )
     _bump_summary(session, _transition_deltas(
-        item.get("team", "untagged"), item.get("status", STATUS_OPEN), STATUS_EXEMPTED,
+        item.get("team", "untagged"), item.get("severity", "UNKNOWN"),
+        item.get("status", STATUS_OPEN), STATUS_EXEMPTED,
     ))
     audit_log.log_transition(
         session,
@@ -290,6 +312,50 @@ def exempt(session: Any, violation_id: str, reason: str = "") -> bool:
         context=reason,
     )
     log.info("store.exempted", violation_id=violation_id)
+    return True
+
+
+def reopen(session: Any, violation_id: str, by: str = "dashboard-user") -> bool:
+    """Move an ACKNOWLEDGED, SNOOZED or EXEMPTED finding back to OPEN. Returns
+    False if it doesn't exist or isn't reopenable (OPEN/RESOLVED are untouched)."""
+    item = get_by_id(session, violation_id)
+    if not item or item.get("status") not in REOPENABLE_STATUSES:
+        return False
+    from_status = item["status"]
+    try:
+        # Conditioned on the status we read, so the deltas describe the real transition.
+        _table(session).update_item(
+            Key={"pk": item["pk"]},
+            UpdateExpression=(
+                "SET #s=:open, active_pk=:apk, acknowledged_by=:null, acknowledged_at=:null, "
+                "snooze_until=:null, exempt_reason=:null"
+            ),
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":open": STATUS_OPEN,
+                ":apk":  _active_pk(STATUS_OPEN, item["pk"]),
+                ":null": None,
+                ":from": from_status,
+            },
+            ConditionExpression="#s = :from",
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        return False
+    _bump_summary(session, _transition_deltas(
+        item.get("team", "untagged"), item.get("severity", "UNKNOWN"),
+        from_status, STATUS_OPEN,
+    ))
+    audit_log.log_transition(
+        session,
+        violation_id=violation_id,
+        action="reopen",
+        actor=by,
+        from_status=from_status,
+        to_status=STATUS_OPEN,
+    )
+    log.info("store.reopened", violation_id=violation_id, by=by)
     return True
 
 
@@ -307,7 +373,8 @@ def mark_resolved(session: Any, pk: str) -> None:
         old         = result["Attributes"]
         from_status = old.get("status", STATUS_OPEN)
         _bump_summary(session, _transition_deltas(
-            old.get("team", "untagged"), from_status, STATUS_RESOLVED,
+            old.get("team", "untagged"), old.get("severity", "UNKNOWN"),
+            from_status, STATUS_RESOLVED,
         ))
         vid = old.get("violation_id", "")
         if vid:
@@ -336,7 +403,7 @@ def wake_snoozed_violations(session: Any) -> int:
             "IndexName": "active-pk-index",
             "KeyConditionExpression": Key("active_pk").eq(shard_key),
             "FilterExpression": Attr("snooze_until").lt(now),
-            "ProjectionExpression": "pk, violation_id, team",
+            "ProjectionExpression": "pk, violation_id, team, severity",
         }
         while True:
             resp = table.query(**kwargs)
@@ -355,7 +422,8 @@ def wake_snoozed_violations(session: Any) -> int:
                     )
                     woken += 1
                     _bump_summary(session, _transition_deltas(
-                        item.get("team", "untagged"), STATUS_SNOOZED, STATUS_OPEN,
+                        item.get("team", "untagged"), item.get("severity", "UNKNOWN"),
+                        STATUS_SNOOZED, STATUS_OPEN,
                     ))
                     if item.get("violation_id"):
                         audit_log.log_transition(
@@ -547,7 +615,9 @@ def _scan_counters(session: Any) -> dict[str, int]:
             s   = item.get("status", "UNKNOWN")
             sev = item.get("severity", "UNKNOWN")
             tm  = item.get("team", "untagged")
-            for key in ("total", f"status#{s}", f"sev#{sev}", f"team#{tm}#{s}"):
+            for key in (
+                "total", f"status#{s}", f"sev#{sev}", f"team#{tm}#{s}", f"sevstatus#{sev}#{s}",
+            ):
                 counters[key] = counters.get(key, 0) + 1
         if "LastEvaluatedKey" not in resp:
             break
@@ -562,6 +632,7 @@ def _counters_to_summary(counters: dict[str, Any]) -> dict[str, Any]:
         "by_status": {},
         "by_severity": {},
         "by_team": {},
+        "by_severity_status": {},
     }
     for key, raw in counters.items():
         n = max(0, int(raw))  # DynamoDB returns Decimal
@@ -578,6 +649,9 @@ def _counters_to_summary(counters: dict[str, Any]) -> dict[str, Any]:
             )
             if status in bucket:
                 bucket[status] = n
+        elif key.startswith("sevstatus#"):
+            sev, _, status = key[len("sevstatus#"):].rpartition("#")
+            summary["by_severity_status"].setdefault(sev, {})[status] = n
     return summary
 
 
@@ -586,7 +660,7 @@ def rebuild_summary(session: Any) -> dict[str, Any]:
     counters = _scan_counters(session)
     try:
         _summary_table(session).put_item(
-            Item={"pk": SUMMARY_PK, "rebuilt_at": _now(), **counters},
+            Item={"pk": SUMMARY_PK, "rebuilt_at": _now(), "schema": SUMMARY_SCHEMA, **counters},
         )
         log.info("store.summary_rebuilt", total=counters["total"])
     except ClientError as exc:
@@ -595,13 +669,14 @@ def rebuild_summary(session: Any) -> dict[str, Any]:
 
 
 def reconcile_summary_if_stale(session: Any) -> bool:
-    """Rebuild the aggregate if it's missing or older than SUMMARY_REBUILD_HOURS."""
+    """Rebuild the aggregate if it's missing, from an older SUMMARY_SCHEMA, or
+    older than SUMMARY_REBUILD_HOURS."""
     try:
         item = _summary_table(session).get_item(Key={"pk": SUMMARY_PK}).get("Item")
     except ClientError as exc:
         log.warning("store.summary_read_failed", error=str(exc))
         return False
-    if item and item.get("rebuilt_at"):
+    if item and item.get("rebuilt_at") and int(item.get("schema", 1)) >= SUMMARY_SCHEMA:
         age = datetime.now(tz=UTC) - datetime.fromisoformat(str(item["rebuilt_at"]))
         if age < timedelta(hours=SUMMARY_REBUILD_HOURS):
             return False
@@ -624,4 +699,77 @@ def get_summary(session: Any) -> dict[str, Any]:
         return _counters_to_summary(_scan_counters(session))
     if not item:
         return rebuild_summary(session)
-    return _counters_to_summary({k: v for k, v in item.items() if k not in ("pk", "rebuilt_at")})
+    return _counters_to_summary({k: v for k, v in item.items() if k not in _SUMMARY_META})
+
+
+# ── Trend snapshots ───────────────────────────────────────────────────────────
+
+def _trend_pk(day: str) -> str:
+    return f"{TREND_PK_PREFIX}{day}"
+
+
+def _active_by_severity(counters: dict[str, Any]) -> dict[str, int]:
+    """Active (OPEN + ACKNOWLEDGED + SNOOZED) counts per severity, from sevstatus counters."""
+    counts = dict.fromkeys(SEVERITIES, 0)
+    total  = 0
+    for key, raw in counters.items():
+        if not key.startswith("sevstatus#"):
+            continue
+        sev, _, status = key[len("sevstatus#"):].rpartition("#")
+        if status not in ACTIVE_STATUSES:
+            continue
+        n = max(0, int(raw))  # clamp negative drift, like /summary
+        total += n
+        if sev in counts:
+            counts[sev] += n
+    return {**counts, "total_active": total}
+
+
+def record_trend_snapshot(session: Any) -> dict[str, Any] | None:
+    """Store today's (UTC) active-by-severity snapshot, overwriting any earlier
+    run today. Best-effort: logs and returns None on failure."""
+    table = _summary_table(session)
+    try:
+        item = table.get_item(Key={"pk": SUMMARY_PK}).get("Item") or {}
+        snapshot: dict[str, Any] = {
+            "pk":          _trend_pk(datetime.now(tz=UTC).date().isoformat()),
+            **_active_by_severity({k: v for k, v in item.items() if k not in _SUMMARY_META}),
+            "recorded_at": _now(),
+        }
+        table.put_item(Item=snapshot)
+    except ClientError as exc:
+        log.warning("store.trend_snapshot_failed", error=str(exc))
+        return None
+    log.info("store.trend_snapshot", pk=snapshot["pk"], total_active=snapshot["total_active"])
+    return snapshot
+
+
+def get_trend(session: Any, days: int) -> list[dict[str, Any]]:
+    """Snapshots for the last `days` UTC dates (today included), oldest first.
+    Dates without a snapshot are omitted."""
+    days  = max(1, min(TREND_MAX_DAYS, days))
+    today = datetime.now(tz=UTC).date()
+    dates = [(today - timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)]
+    found: dict[str, dict[str, Any]] = {}
+    ddb   = session.resource("dynamodb")
+    try:
+        for i in range(0, len(dates), 100):  # BatchGetItem takes at most 100 keys
+            pending: dict[str, Any] = {
+                SUMMARY_TABLE: {"Keys": [{"pk": _trend_pk(d)} for d in dates[i:i + 100]]},
+            }
+            while pending:
+                resp = ddb.batch_get_item(RequestItems=pending)
+                for item in resp.get("Responses", {}).get(SUMMARY_TABLE, []):
+                    found[str(item["pk"])[len(TREND_PK_PREFIX):]] = item
+                pending = resp.get("UnprocessedKeys") or {}
+    except ClientError as exc:
+        log.warning("store.trend_read_failed", error=str(exc))
+        return []
+    return [
+        {
+            "date": d,
+            **{sev: int(found[d].get(sev, 0)) for sev in SEVERITIES},
+            "total_active": int(found[d].get("total_active", 0)),
+        }
+        for d in dates if d in found
+    ]

@@ -120,6 +120,9 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if store.reconcile_summary_if_stale(session):
         log.info("handler.summary_reconciled")
 
+    # Daily posture trend: today's active-by-severity, last run of the day wins.
+    store.record_trend_snapshot(session)
+
     _push_metrics(cw_client, resources_audited, len(current_violations), duration_ms)
 
     # Alert only on genuinely new violations — skip noise for already-tracked ones
