@@ -1,286 +1,301 @@
-import { useState } from 'react'
-import { api } from '../api/client'
-import type { AuditEvent, Violation } from '../types'
-import { SeverityBadge } from './SeverityBadge'
-import { StatusBadge } from './StatusBadge'
-
-const RESOURCE_ICON: Record<string, string> = {
-  'AWS::S3::Bucket':          'S3',
-  'AWS::EC2::SecurityGroup':  'SG',
-  'AWS::IAM::User':           'IAM',
-  'AWS::IAM::AccessKey':      'KEY',
-  'AWS::IAM::PasswordPolicy': 'PWD',
-  'AWS::IAM::RootAccount':    'ROOT',
-  'AWS::CloudTrail::Trail':   'CT',
-  'AWS::RDS::DBInstance':     'RDS',
-  'AWS::KMS::Key':            'KMS',
-  'AWS::EC2::Volume':         'EBS',
-  'AWS::EC2::Snapshot':       'SNAP',
-  'AWS::::Account':           'ACCT',
-}
-
-/** Service owning each rule_id prefix; used for the tag and console link when the resource type is unknown or account-level. */
-const RULE_SERVICE: Record<string, { tag: string; home: (region: string) => string }> = {
-  S3:  { tag: 'S3',  home: () => 'https://s3.console.aws.amazon.com/s3/home' },
-  IAM: { tag: 'IAM', home: () => 'https://us-east-1.console.aws.amazon.com/iamv2/home' },
-  EC2: { tag: 'EC2', home: (r) => `https://${r}.console.aws.amazon.com/ec2/home?region=${r}` },
-  CT:  { tag: 'CT',  home: (r) => `https://${r}.console.aws.amazon.com/cloudtrailv2/home?region=${r}#/trails` },
-  RDS: { tag: 'RDS', home: (r) => `https://${r}.console.aws.amazon.com/rds/home?region=${r}#databases:` },
-  KMS: { tag: 'KMS', home: (r) => `https://${r}.console.aws.amazon.com/kms/home?region=${r}#/kms/keys` },
-  EBS: { tag: 'EBS', home: (r) => `https://${r}.console.aws.amazon.com/ec2/home?region=${r}#Volumes:` },
-}
-
-function ruleService(ruleId: string) {
-  return RULE_SERVICE[ruleId.split('_')[0]]
-}
-
-/** Last path segment of an ARN (e.g. key/1234 → 1234), or the id unchanged. */
-function shortId(id: string): string {
-  return id.startsWith('arn:') ? id.split(/[:/]/).pop() ?? id : id
-}
-
-const SEV_COLOR: Record<string, string> = {
-  CRITICAL: '#f87171',
-  HIGH:     '#fb923c',
-  MEDIUM:   '#fbbf24',
-  LOW:      '#4ade80',
-}
-
-const AWS_CONSOLE: Record<string, (id: string, region: string) => string> = {
-  'AWS::S3::Bucket':         (id) => `https://s3.console.aws.amazon.com/s3/buckets/${id}`,
-  'AWS::EC2::SecurityGroup': (id, r) => `https://${r}.console.aws.amazon.com/ec2/home?region=${r}#SecurityGroups:groupId=${id}`,
-  'AWS::IAM::User':          (id) => `https://us-east-1.console.aws.amazon.com/iamv2/home#/users/details/${id}`,
-  'AWS::IAM::PasswordPolicy':() => `https://us-east-1.console.aws.amazon.com/iamv2/home#/account_settings`,
-  'AWS::IAM::AccessKey':     (id) => `https://us-east-1.console.aws.amazon.com/iamv2/home#/users/details/${id.split('/')[0]}`,
-  'AWS::CloudTrail::Trail':  (id, r) => id.startsWith('arn:')
-    ? `https://${r}.console.aws.amazon.com/cloudtrailv2/home?region=${r}#/trails/${encodeURIComponent(id)}`
-    : `https://${r}.console.aws.amazon.com/cloudtrailv2/home?region=${r}#/trails`,
-  'AWS::RDS::DBInstance':    (id, r) => `https://${r}.console.aws.amazon.com/rds/home?region=${r}#database:id=${shortId(id)};is-cluster=false`,
-  'AWS::KMS::Key':           (id, r) => `https://${r}.console.aws.amazon.com/kms/home?region=${r}#/kms/keys/${shortId(id)}`,
-  'AWS::EC2::Volume':        (id, r) => `https://${r}.console.aws.amazon.com/ec2/home?region=${r}#VolumeDetails:volumeId=${shortId(id)}`,
-  'AWS::EC2::Snapshot':      (id, r) => `https://${r}.console.aws.amazon.com/ec2/home?region=${r}#SnapshotDetails:snapshotId=${shortId(id)}`,
-  // Account-level checks have no resource page; fall back to the rule's service console (see RULE_SERVICE).
-}
-
-const ACTION_ICON: Record<string, string> = {
-  detect:      '◉',
-  acknowledge: '◎',
-  snooze:      '◷',
-  exempt:      '–',
-  resolve:     '✓',
-  wake:        '▶',
-}
-
-function timeAgo(iso: string): string {
-  const diff  = Date.now() - new Date(iso).getTime()
-  const mins  = Math.floor(diff / 60_000)
-  const hours = Math.floor(diff / 3_600_000)
-  const days  = Math.floor(diff / 86_400_000)
-  if (days > 0)  return `${days}d ago`
-  if (hours > 0) return `${hours}h ago`
-  return `${mins}m ago`
-}
+import { memo, useEffect, useId, useState } from 'react'
+import { api, errorMessage } from '../api/client'
+import { consoleUrl, remediation, resourceTag, SEV_STYLE } from '../lib/catalog'
+import { fullDate, relativeTime } from '../lib/format'
+import type { AuditEvent, TriageAction, Violation } from '../types'
+import { SeverityBadge, StatusBadge } from './Badges'
+import { Dialog } from './Dialog'
+import { Icon, Spinner } from './Icon'
+import { Menu } from './Menu'
 
 interface Props {
-  violation:        Violation
-  onAcknowledge:    (id: string) => void
-  onSnooze:         (id: string, days: number) => void
-  onExempt:         (id: string) => void
-  showRemediation?: string
+  violation: Violation
+  busy?:     boolean
+  leaving?:  boolean
+  onAction:  (v: Violation, action: TriageAction, arg?: number | string) => void
+  /** Open the "how to fix" panel by default (the My Resources view does). */
+  defaultFixOpen?: boolean
+  /** Whether the server supports reopening (older backends don't). */
+  canReopen?: boolean
 }
 
-export function ViolationCard({ violation: v, onAcknowledge, onSnooze, onExempt, showRemediation }: Props) {
-  const [showHistory, setShowHistory] = useState(false)
-  const [history, setHistory]         = useState<AuditEvent[]>([])
-  const [loadingHistory, setLoading]  = useState(false)
+const SNOOZE_OPTIONS = [
+  { days: 1,  label: '1 day' },
+  { days: 7,  label: '7 days' },
+  { days: 30, label: '30 days' },
+]
 
-  const service    = ruleService(v.rule_id)
-  const tag        = RESOURCE_ICON[v.resource_type]
-    ?? service?.tag
-    ?? (v.resource_type.split('::')[1] || 'AWS').slice(0, 4).toUpperCase()
-  const consoleUrl = AWS_CONSOLE[v.resource_type]?.(v.resource_id, v.region)
-    ?? service?.home(v.region)
-    ?? `https://${v.region}.console.aws.amazon.com/console/home?region=${v.region}`
-  const isOpen     = v.status === 'OPEN'
-  const borderClr  = SEV_COLOR[v.severity] ?? '#f87171'
+const ACTION_LABEL: Record<string, string> = {
+  detect: 'Detected', acknowledge: 'Acknowledged', snooze: 'Snoozed', exempt: 'Exempted',
+  resolve: 'Resolved', wake: 'Snooze expired', reopen: 'Reopened',
+}
+const ACTION_ICON: Record<string, string> = {
+  detect: 'sparkle', acknowledge: 'eye', snooze: 'clock', exempt: 'slash', resolve: 'check', wake: 'play', reopen: 'undo',
+}
 
-  const toggleHistory = async () => {
-    if (!showHistory && history.length === 0) {
-      setLoading(true)
-      try {
-        const data = await api.getViolationHistory(v.violation_id)
-        setHistory(data.events)
-      } finally {
-        setLoading(false)
-      }
-    }
-    setShowHistory((s) => !s)
-  }
+function Time({ iso, prefix }: { iso: string | null; prefix?: string }) {
+  if (!iso) return null
+  return <time dateTime={iso} title={fullDate(iso)}>{prefix}{relativeTime(iso)}</time>
+}
 
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false)
   return (
-    <div
-      className={`animate-fade-in rounded-xl overflow-hidden transition-all duration-200 vcard-${v.severity}`}
-      style={{
-        border: `1px solid rgba(${v.severity === 'CRITICAL' ? '248,113,113' : v.severity === 'HIGH' ? '251,146,60' : v.severity === 'MEDIUM' ? '251,191,36' : '74,222,128'},0.15)`,
-        borderLeft: `3px solid ${borderClr}`,
-        boxShadow: '0 2px 16px rgba(0,0,0,0.35)',
+    <button
+      type="button"
+      className="btn btn-ghost btn-icon h-6 min-h-0 w-6 flex-shrink-0 rounded-md text-faint"
+      aria-label={copied ? 'Copied' : 'Copy resource ID'}
+      title={copied ? 'Copied' : 'Copy resource ID'}
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(text)
+          setCopied(true)
+          window.setTimeout(() => setCopied(false), 1400)
+        } catch { /* clipboard unavailable (insecure context) */ }
       }}
     >
-      {/* Header */}
-      <div
-        className="flex items-center gap-2.5 px-4 py-2.5"
-        style={{ background: 'rgba(255,255,255,0.025)', borderBottom: '1px solid rgba(255,255,255,0.04)' }}
-      >
-        <SeverityBadge severity={v.severity} />
-        <span className="text-[10px] text-muted/50 font-mono tracking-wider">{v.rule_id}</span>
-        <span className="text-sm text-text font-semibold flex-1 truncate">{v.rule_name}</span>
-        <StatusBadge status={v.status} />
-      </div>
+      <Icon name={copied ? 'check' : 'copy'} size={12} className={copied ? 'text-low' : ''} />
+    </button>
+  )
+}
 
-      {/* Body */}
-      <div className="px-4 py-3 space-y-2.5">
-        {/* Resource row */}
-        <div className="flex items-center gap-2 flex-wrap">
-          <span
-            className="text-[9px] font-bold px-1.5 py-0.5 rounded"
-            style={{ background: 'rgba(255,255,255,0.06)', color: '#7a8499', letterSpacing: '0.05em' }}
-          >
-            {tag}
-          </span>
-          <span className="text-[11px] text-muted/60">{v.resource_type}</span>
-          <code
-            className="text-xs font-mono px-2 py-0.5 rounded-md"
-            style={{ background: 'rgba(96,165,250,0.1)', color: '#60a5fa', border: '1px solid rgba(96,165,250,0.2)' }}
-          >
-            {v.resource_id}
-          </code>
-          {v.team !== 'untagged' && (
-            <span className="ml-auto flex items-center gap-1 text-[11px]">
-              <span className="text-muted/40">team</span>
-              <span
-                className="px-1.5 py-0.5 rounded text-[10px] font-semibold"
-                style={{ background: 'rgba(167,139,250,0.1)', color: '#a78bfa', border: '1px solid rgba(167,139,250,0.15)' }}
-              >
+function ViolationCardImpl({ violation: v, busy = false, leaving = false, onAction, defaultFixOpen = false, canReopen = true }: Props) {
+  const [detailsOpen, setDetailsOpen] = useState(defaultFixOpen)
+  const [history, setHistory]         = useState<AuditEvent[] | null>(null)
+  const [historyError, setHistoryErr] = useState<string | null>(null)
+  const [exemptOpen, setExemptOpen]   = useState(false)
+  const [reason, setReason]           = useState('')
+  const detailsId = useId()
+
+  const sev   = SEV_STYLE[v.severity]
+  const fix   = remediation(v.rule_id)
+  const link  = consoleUrl(v)
+  const tag   = resourceTag(v)
+  const count = Number(v.occurrence_count) || 1
+
+  // Load the lifecycle history the first time details are shown — whether the
+  // user opened them or the card started open.
+  useEffect(() => {
+    if (!detailsOpen || history !== null) return
+    let live = true
+    setHistoryErr(null)
+    api.getViolationHistory(v.violation_id)
+      .then((r) => { if (live) setHistory(r.events) })
+      .catch((e) => { if (live) setHistoryErr(errorMessage(e)) })
+    return () => { live = false }
+  }, [detailsOpen, history, v.violation_id])
+
+  // A status change means new history; drop the cached copy.
+  useEffect(() => { setHistory(null) }, [v.status])
+
+  const toggleDetails = () => setDetailsOpen((o) => !o)
+
+  const submitExempt = () => {
+    const r = reason.trim()
+    if (!r) return
+    setExemptOpen(false)
+    setReason('')
+    onAction(v, 'exempt', r)
+  }
+
+  const snoozeMenu = (
+    <Menu
+      items={SNOOZE_OPTIONS.map((o) => ({ label: `Snooze ${o.label}`, onSelect: () => onAction(v, 'snooze', o.days) }))}
+      trigger={(p) => (
+        <button {...p} className="btn btn-secondary" disabled={busy}>
+          <Icon name="clock" size={13} /> Snooze <Icon name="chevron-down" size={11} />
+        </button>
+      )}
+    />
+  )
+  const exemptBtn = (
+    <button className="btn btn-ghost" disabled={busy} onClick={() => setExemptOpen(true)}>
+      <Icon name="slash" size={13} /> Exempt…
+    </button>
+  )
+  const reopenBtn = canReopen && (
+    <button className="btn btn-secondary" disabled={busy} onClick={() => onAction(v, 'reopen')}>
+      <Icon name="undo" size={13} /> Reopen
+    </button>
+  )
+
+  return (
+    <div className={`card-wrap ${leaving ? 'card-leave' : ''}`} aria-hidden={leaving || undefined}>
+      <article
+        aria-busy={busy || undefined}
+        aria-label={`${v.severity} ${v.rule_name}: ${v.resource_id}`}
+        className="group relative overflow-hidden rounded-xl border transition-[border-color,box-shadow,transform] duration-200
+                   hover:-translate-y-px"
+        style={{
+          borderColor: `rgba(${sev.rgb},0.16)`,
+          background: `linear-gradient(135deg, rgba(${sev.rgb},0.05) 0%, rgba(15,23,36,0.9) 40%, rgba(11,16,25,0.9) 100%)`,
+          boxShadow: '0 2px 16px rgba(0,0,0,0.35)',
+        }}
+      >
+        {/* Severity rail */}
+        <span className="absolute inset-y-0 left-0 w-[3px]" style={{ background: sev.color, boxShadow: `0 0 12px ${sev.color}` }} aria-hidden="true" />
+
+        {/* Busy veil */}
+        {busy && (
+          <div className="absolute inset-0 z-10 flex animate-fade-in items-center justify-center bg-bg/40 backdrop-blur-[1px]">
+            <span className="flex items-center gap-2 rounded-full border border-white/10 bg-card px-3 py-1.5 text-xs text-subtle">
+              <Spinner size={12} /> Saving…
+            </span>
+          </div>
+        )}
+
+        {/* Header */}
+        <header className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 border-b border-white/[0.04] bg-white/[0.02] py-2.5 pl-5 pr-4">
+          <SeverityBadge severity={v.severity} />
+          <h3 className="min-w-0 flex-1 basis-40 text-sm font-semibold leading-snug text-text">{v.rule_name}</h3>
+          <span className="hidden font-mono text-[10px] tracking-wider text-faint sm:inline">{v.rule_id}</span>
+          <StatusBadge status={v.status} />
+        </header>
+
+        {/* Body */}
+        <div className="space-y-2.5 py-3 pl-5 pr-4">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[9px] font-bold tracking-wider text-subtle">{tag}</span>
+            <span className="flex min-w-0 max-w-full items-center gap-0.5 rounded-md border border-accent/20 bg-accent/10 pl-2 pr-0.5">
+              <code className="truncate py-0.5 font-mono text-xs text-accent" title={v.resource_id}>{v.resource_id}</code>
+              <CopyButton text={v.resource_id} />
+            </span>
+            {v.team && v.team !== 'untagged' && (
+              <span className="ml-auto rounded border border-violet/20 bg-violet/10 px-1.5 py-0.5 text-[10px] font-semibold text-violet">
                 {v.team}
               </span>
-            </span>
-          )}
-        </div>
+            )}
+          </div>
 
-        <p className="text-xs leading-relaxed" style={{ color: '#9aa3b5' }}>{v.reason}</p>
+          <p className="text-[13px] leading-relaxed text-subtle">{v.reason}</p>
 
-        {/* Meta + account context */}
-        <div className="flex items-center flex-wrap gap-y-0.5 text-[11px]" style={{ color: '#4b5568' }}>
-          <span>First seen {timeAgo(v.first_detected)}</span>
-          <span className="mx-2 opacity-30">·</span>
-          <span>Last seen {timeAgo(v.last_seen)}</span>
-          {v.occurrence_count > 1 && (
-            <>
-              <span className="mx-2 opacity-30">·</span>
-              <span
-                className="px-1.5 py-0.5 rounded text-[10px]"
-                style={{ background: 'rgba(251,191,36,0.08)', color: '#fbbf24' }}
-              >
-                {v.occurrence_count}× recurrence
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted">
+            <Time iso={v.first_detected} prefix="First seen " />
+            <Time iso={v.last_seen} prefix="Last seen " />
+            {count > 1 && (
+              <span className="rounded bg-medium/10 px-1.5 py-0.5 font-medium text-medium" title="Times this finding was re-detected by the auditor">
+                Seen {count.toLocaleString()}×
               </span>
-            </>
+            )}
+            {v.status === 'ACKNOWLEDGED' && v.acknowledged_by && (
+              <span>Acknowledged by <span className="text-accent">{v.acknowledged_by}</span></span>
+            )}
+            {v.status === 'SNOOZED' && v.snooze_until && (
+              <span className="text-high">Snoozed until <time dateTime={v.snooze_until} title={fullDate(v.snooze_until)}>{fullDate(v.snooze_until)}</time></span>
+            )}
+            {v.status === 'RESOLVED' && v.resolved_at && <Time iso={v.resolved_at} prefix="Resolved " />}
+            {v.account_id && v.account_id !== 'unknown' && (
+              <span className="font-mono text-faint">{v.account_id} · {v.region}</span>
+            )}
+          </div>
+
+          {v.status === 'EXEMPTED' && v.exempt_reason && (
+            <p className="rounded-lg border border-white/[0.06] bg-white/[0.03] px-3 py-2 text-xs text-muted">
+              <span className="font-semibold text-subtle">Exemption:</span> {v.exempt_reason}
+            </p>
           )}
-          {v.acknowledged_by && (
-            <>
-              <span className="mx-2 opacity-30">·</span>
-              <span>Ack'd by <span style={{ color: '#60a5fa80' }}>{v.acknowledged_by}</span></span>
-            </>
-          )}
-          {v.account_id && v.account_id !== 'unknown' && (
-            <>
-              <span className="mx-2 opacity-30">·</span>
-              <span className="font-mono">{v.account_id} / {v.region}</span>
-            </>
-          )}
+
+          <button
+            onClick={toggleDetails}
+            aria-expanded={detailsOpen}
+            aria-controls={detailsId}
+            className="-ml-1 flex items-center gap-1 rounded px-1 py-0.5 text-[11px] font-medium text-muted transition-colors hover:text-text"
+          >
+            <Icon name="chevron" size={11} className={`transition-transform duration-200 ${detailsOpen ? 'rotate-90' : ''}`} />
+            {detailsOpen ? 'Hide details' : 'How to fix & history'}
+          </button>
         </div>
 
-        {/* History toggle */}
-        <button
-          onClick={toggleHistory}
-          className="text-[11px] transition-colors flex items-center gap-1"
-          style={{ color: showHistory ? '#60a5fa' : '#4b5568' }}
-        >
-          <svg
-            width="10" height="10" viewBox="0 0 10 10" fill="none"
-            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"
-            style={{ transform: showHistory ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }}
-          >
-            <path d="M3 1.5l3 3.5-3 3.5"/>
-          </svg>
-          {showHistory ? 'Hide' : 'Show'} history
-        </button>
-      </div>
-
-      {/* History timeline */}
-      {showHistory && (
-        <div className="px-4 pb-3" style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }}>
-          {loadingHistory ? (
-            <p className="text-[11px] text-muted py-2">Loading…</p>
-          ) : history.length === 0 ? (
-            <p className="text-[11px] text-muted py-2">No history recorded yet.</p>
-          ) : (
-            <div className="mt-3 space-y-2">
-              {history.map((e, i) => (
-                <div key={i} className="flex items-start gap-2.5 text-[11px]">
-                  <span
-                    className="mt-0.5 flex-shrink-0 w-4 h-4 rounded-full flex items-center justify-center text-[9px]"
-                    style={{ background: 'rgba(255,255,255,0.06)', color: '#7a8499' }}
-                  >
-                    {ACTION_ICON[e.action] ?? '·'}
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <span className="font-semibold" style={{ color: '#dde3ef' }}>{e.action}</span>
-                    {e.actor && <span className="text-muted/60"> by <span style={{ color: '#a78bfa80' }}>{e.actor}</span></span>}
-                    {e.context && <span className="text-muted/50"> · {e.context}</span>}
-                  </div>
-                  <span className="flex-shrink-0 text-muted/40">{timeAgo(e.timestamp)}</span>
-                </div>
-              ))}
+        {/* Details: remediation + lifecycle timeline */}
+        <div id={detailsId} className="collapse-grid" data-open={detailsOpen}>
+          <div>
+            <div className="grid gap-4 border-t border-white/[0.04] py-3.5 pl-5 pr-4 md:grid-cols-2">
+              {fix && (
+                <section>
+                  <p className="eyebrow mb-1.5 flex items-center gap-1.5 text-accent"><Icon name="wrench" size={11} /> How to fix</p>
+                  <p className="text-xs leading-relaxed text-subtle">{fix}</p>
+                </section>
+              )}
+              <section>
+                <p className="eyebrow mb-2">History</p>
+                {historyError ? (
+                  <p className="text-xs text-critical">Couldn't load history: {historyError}</p>
+                ) : history === null ? (
+                  <div className="space-y-2"><div className="skeleton h-3 w-2/3" /><div className="skeleton h-3 w-1/2" /></div>
+                ) : history.length === 0 ? (
+                  <p className="text-xs text-muted">No lifecycle events recorded yet.</p>
+                ) : (
+                  <ol className="relative space-y-2.5 border-l border-white/10 pl-4">
+                    {history.map((e, i) => (
+                      <li key={`${e.timestamp}-${i}`} className="relative text-xs">
+                        <span className="absolute -left-[23px] top-0 flex h-[14px] w-[14px] items-center justify-center rounded-full border border-white/10 bg-card text-muted">
+                          <Icon name={ACTION_ICON[e.action] ?? 'info'} size={8} strokeWidth={2} />
+                        </span>
+                        <span className="font-medium text-text">{ACTION_LABEL[e.action] ?? e.action}</span>
+                        {e.actor && <span className="text-muted"> by <span className="text-violet">{e.actor}</span></span>}
+                        {e.context && <span className="text-muted"> · {e.context}</span>}
+                        <Time iso={e.timestamp} prefix=" · " />
+                      </li>
+                    ))}
+                  </ol>
+                )}
+              </section>
             </div>
+          </div>
+        </div>
+
+        {/* Actions */}
+        <footer className="flex flex-wrap items-center gap-2 border-t border-white/[0.04] py-2.5 pl-5 pr-4">
+          {v.status === 'OPEN' && (
+            <>
+              <button className="btn btn-primary" disabled={busy} onClick={() => onAction(v, 'acknowledge')}>
+                <Icon name="eye" size={13} /> Acknowledge
+              </button>
+              {snoozeMenu}
+              {exemptBtn}
+            </>
           )}
-        </div>
-      )}
-
-      {/* Action buttons */}
-      {isOpen && (
-        <div
-          className="flex items-center gap-2 px-4 py-2.5 flex-wrap"
-          style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }}
-        >
-          <button className="btn btn-primary" onClick={() => onAcknowledge(v.violation_id)}>Acknowledge</button>
-          <button className="btn btn-secondary" onClick={() => onSnooze(v.violation_id, 7)}>Snooze 7d</button>
-          <button className="btn btn-secondary" onClick={() => onSnooze(v.violation_id, 30)}>Snooze 30d</button>
-          <button className="btn btn-ghost" onClick={() => onExempt(v.violation_id)}>Exempt</button>
-          <a href={consoleUrl} target="_blank" rel="noreferrer" className="btn btn-ghost ml-auto" style={{ color: '#60a5fa' }}>
-            Open in AWS →
+          {v.status === 'ACKNOWLEDGED' && <>{snoozeMenu}{exemptBtn}{reopenBtn}</>}
+          {v.status === 'SNOOZED' && <>{reopenBtn}{exemptBtn}</>}
+          {v.status === 'EXEMPTED' && reopenBtn}
+          <a href={link} target="_blank" rel="noreferrer" className="btn btn-ghost ml-auto text-accent hover:text-accent">
+            Open in AWS <Icon name="external" size={12} />
+            <span className="sr-only">(opens in a new tab)</span>
           </a>
-        </div>
-      )}
+        </footer>
+      </article>
 
-      {!isOpen && (
-        <div className="flex justify-end px-4 py-2" style={{ borderTop: '1px solid rgba(255,255,255,0.03)' }}>
-          <a
-            href={consoleUrl} target="_blank" rel="noreferrer"
-            className="text-[11px] transition-colors" style={{ color: '#4b5568' }}
-            onMouseOver={(e) => (e.currentTarget.style.color = '#60a5fa')}
-            onMouseOut={(e) => (e.currentTarget.style.color = '#4b5568')}
-          >
-            Open in AWS →
-          </a>
-        </div>
-      )}
-
-      {showRemediation && (
-        <div className="px-4 py-3" style={{ background: 'rgba(96,165,250,0.04)', borderTop: '1px solid rgba(96,165,250,0.1)' }}>
-          <p className="text-[10px] font-bold uppercase tracking-widest mb-1.5" style={{ color: '#60a5fa' }}>How to fix</p>
-          <p className="text-xs leading-relaxed" style={{ color: '#7a8499' }}>{showRemediation}</p>
-        </div>
-      )}
+      <Dialog
+        open={exemptOpen}
+        onClose={() => setExemptOpen(false)}
+        title="Exempt this finding?"
+        description="It stays tracked and is re-checked every audit, but never alerts again until reopened."
+        footer={
+          <>
+            <button className="btn btn-ghost" onClick={() => setExemptOpen(false)}>Cancel</button>
+            <button className="btn btn-accent" onClick={submitExempt} disabled={!reason.trim()}>Exempt finding</button>
+          </>
+        }
+      >
+        <p className="mb-3 text-xs text-muted">
+          <span className="font-semibold text-subtle">{v.rule_name}</span> on <code className="break-all font-mono text-accent">{v.resource_id}</code>
+        </p>
+        <label className="mb-1.5 block text-xs font-semibold text-subtle" htmlFor={`${detailsId}-reason`}>
+          Reason <span className="font-normal text-muted">(recorded in the audit trail)</span>
+        </label>
+        <textarea
+          id={`${detailsId}-reason`}
+          className="input min-h-[88px] resize-y"
+          placeholder="e.g. Accepted risk — internal-only bucket behind VPC endpoint; reviewed by security on 2026-09-20"
+          value={reason}
+          maxLength={500}
+          onChange={(e) => setReason(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitExempt() }}
+        />
+        <p className="mt-1 text-right text-[11px] text-faint tabular">{reason.length}/500</p>
+      </Dialog>
     </div>
   )
 }
+
+export const ViolationCard = memo(ViolationCardImpl)

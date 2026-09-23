@@ -39,6 +39,33 @@ jobs:
       - name: Mypy type check
         run: mypy src/ --ignore-missing-imports
 
+      - name: Validate templates (SAM transform + cfn-lint)
+        run: python scripts/validate_templates.py
+
+  # ---------------------------------------------------------------------------
+  # Dashboard type-check + production build (runs on every push and PR)
+  # ---------------------------------------------------------------------------
+  dashboard:
+    name: Dashboard build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Type-check and build
+        run: npm run build
+
   # ---------------------------------------------------------------------------
   # Test suite with Moto (fake AWS)
   # ---------------------------------------------------------------------------
@@ -78,7 +105,7 @@ jobs:
   deploy:
     name: Deploy (SAM)
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, dashboard]
     if: >-
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push' &&

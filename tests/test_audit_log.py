@@ -141,6 +141,23 @@ class TestLifecycleWritesAudit:
         events = audit_log.get_history(session, item["violation_id"])
         assert any(e["action"] == "resolve" for e in events)
 
+    def test_reopen_records_event(self, session, sample):
+        item, _ = store.upsert_violation(session, sample)
+        store.snooze(session, item["violation_id"], days=3)
+        store.reopen(session, item["violation_id"], by="bob@acme.com")
+        events = audit_log.get_history(session, item["violation_id"])
+        ro = [e for e in events if e["action"] == "reopen"]
+        assert len(ro) == 1
+        assert ro[0]["actor"] == "bob@acme.com"
+        assert ro[0]["from_status"] == "SNOOZED"
+        assert ro[0]["to_status"] == "OPEN"
+
+    def test_refused_reopen_records_nothing(self, session, sample):
+        item, _ = store.upsert_violation(session, sample)
+        assert store.reopen(session, item["violation_id"]) is False
+        events = audit_log.get_history(session, item["violation_id"])
+        assert not any(e["action"] == "reopen" for e in events)
+
 
 class TestSparseIndex:
     def test_resolved_item_off_active_index(self, session, sample):

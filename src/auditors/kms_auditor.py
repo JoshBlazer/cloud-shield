@@ -23,14 +23,14 @@ class KMSAuditor(BaseAuditor):
             paginator = self._client.get_paginator("list_keys")
             key_ids = [k["KeyId"] for page in paginator.paginate() for k in page.get("Keys", [])]
         except ClientError as exc:
-            log.error("kms.list_keys failed", error=str(exc))
+            self.record_error("kms:ListKeys", exc)
             return resources
 
         for key_id in key_ids:
             try:
                 meta = self._client.describe_key(KeyId=key_id)["KeyMetadata"]
             except ClientError as exc:
-                log.warning("kms.describe_key failed", key_id=key_id, error=str(exc))
+                self.record_error("kms:DescribeKey", exc, key_id=key_id)
                 continue
 
             # Only enabled, customer-managed, symmetric encryption keys support
@@ -47,7 +47,7 @@ class KMSAuditor(BaseAuditor):
                 rotation = self._client.get_key_rotation_status(KeyId=key_id)
                 meta["KeyRotationEnabled"] = bool(rotation.get("KeyRotationEnabled"))
             except ClientError as exc:
-                log.warning("kms.get_key_rotation_status failed", key_id=key_id, error=str(exc))
+                self.record_error("kms:GetKeyRotationStatus", exc, key_id=key_id)
                 continue
 
             try:

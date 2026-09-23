@@ -1,209 +1,203 @@
+import { useEffect, useState } from 'react'
 import { NavLink } from 'react-router-dom'
-import type { Summary } from '../types'
+import { USE_MOCK } from '../api/client'
+import { AUTH_ENABLED, logout } from '../hooks/useAuth'
+import { SEV_STYLE } from '../lib/catalog'
+import { relativeTime } from '../lib/format'
+import { activeBySeverity, useAppData } from '../state/AppData'
+import { SEVERITIES } from '../types'
+import { AnimatedNumber } from './AnimatedNumber'
+import { Icon, Spinner } from './Icon'
 
-const ShieldIcon = () => (
-  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M8 1.5L2 4v4.5c0 3.3 2.3 5.7 6 6.8 3.7-1.1 6-3.5 6-6.8V4L8 1.5z"/>
-    <path d="M5.5 8l1.5 1.5 3-3"/>
-  </svg>
-)
-
-const GridIcon = () => (
-  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-    <rect x="1.5" y="1.5" width="5" height="5" rx="1.2"/>
-    <rect x="9.5" y="1.5" width="5" height="5" rx="1.2"/>
-    <rect x="1.5" y="9.5" width="5" height="5" rx="1.2"/>
-    <rect x="9.5" y="9.5" width="5" height="5" rx="1.2"/>
-  </svg>
-)
-
-const ChartIcon = () => (
-  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-    <polyline points="2,12 5.5,8 8,10.5 12,4.5"/>
-    <line x1="1" y1="14.5" x2="15" y2="14.5"/>
-    <line x1="1" y1="1" x2="1" y2="14.5"/>
-  </svg>
-)
-
-interface NavItemProps {
-  to: string
-  label: string
-  icon: React.ReactNode
-  count?: number
+export function Logo({ compact = false }: { compact?: boolean }) {
+  return (
+    <div className="flex items-center gap-3">
+      <div
+        className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-critical/30 text-critical"
+        style={{ background: 'linear-gradient(135deg, rgba(248,113,113,0.2), rgba(251,146,60,0.12))', boxShadow: '0 0 14px rgba(248,113,113,0.15)' }}
+      >
+        <Icon name="shield-plain" size={15} />
+      </div>
+      <div className="leading-tight">
+        <div className="text-[15px] font-bold tracking-tight text-text">Cloud<span className="text-critical">Shield</span></div>
+        {!compact && <div className="mt-0.5 text-[9px] font-semibold uppercase tracking-[0.2em] text-accent/70">Auditor</div>}
+      </div>
+    </div>
+  )
 }
 
-function NavItem({ to, label, icon, count }: NavItemProps) {
+function NavItem({ to, label, icon, count, onNavigate }: {
+  to: string; label: string; icon: string; count?: number; onNavigate?: () => void
+}) {
   return (
     <NavLink
       to={to}
+      onClick={onNavigate}
       className={({ isActive }) =>
-        `flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-all duration-150 ` +
-        (isActive ? 'text-text font-medium' : 'text-muted hover:text-subtle')
+        `group relative flex items-center gap-3 rounded-lg border px-3 py-2.5 text-sm transition-all duration-200
+         ${isActive
+           ? 'border-accent/20 bg-accent/[0.08] font-medium text-text shadow-[0_0_16px_rgba(96,165,250,0.07)]'
+           : 'border-transparent text-muted hover:bg-white/[0.03] hover:text-text'}`
       }
-      style={({ isActive }) => isActive ? {
-        background: 'linear-gradient(135deg, rgba(96,165,250,0.1) 0%, rgba(96,165,250,0.04) 100%)',
-        border: '1px solid rgba(96,165,250,0.18)',
-        boxShadow: '0 0 16px rgba(96,165,250,0.07)',
-      } : {
-        border: '1px solid transparent',
-      }}
     >
-      <span className="flex-shrink-0 opacity-70">{icon}</span>
-      <span className="flex-1">{label}</span>
-      {count !== undefined && count > 0 && (
-        <span
-          className="text-[10px] font-bold px-1.5 py-0.5 rounded-full min-w-[20px] text-center"
-          style={{
-            background: 'rgba(248,113,113,0.18)',
-            color: '#f87171',
-            border: '1px solid rgba(248,113,113,0.3)',
-            boxShadow: '0 0 8px rgba(248,113,113,0.18)',
-          }}
-        >
-          {count}
-        </span>
+      {({ isActive }) => (
+        <>
+          <span className={`absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-r-full bg-accent transition-all duration-300 ${isActive ? 'opacity-100' : 'scale-y-0 opacity-0'}`} />
+          <Icon name={icon} size={15} className={isActive ? 'text-accent' : 'opacity-80'} />
+          <span className="flex-1">{label}</span>
+          {count !== undefined && count > 0 && (
+            <span className="min-w-[22px] rounded-full border border-critical/30 bg-critical/15 px-1.5 py-0.5 text-center text-[10px] font-bold text-critical tabular">
+              <AnimatedNumber value={count} duration={400} />
+            </span>
+          )}
+        </>
       )}
     </NavLink>
   )
 }
 
-interface Props {
-  summary: Summary | null
-  onTriggerAudit: () => void
-  auditRunning: boolean
+/** Re-render every 30s so "updated 2 min ago" stays true. */
+function useNow(interval = 30_000) {
+  const [now, setNow] = useState(Date.now())
+  useEffect(() => { const t = window.setInterval(() => setNow(Date.now()), interval); return () => window.clearInterval(t) }, [interval])
+  return now
 }
 
-export function Sidebar({ summary, onTriggerAudit, auditRunning }: Props) {
-  const openCount = summary?.by_status['OPEN'] ?? 0
-  const sevCounts = [
-    { key: 'CRITICAL', color: '#f87171' },
-    { key: 'HIGH',     color: '#fb923c' },
-    { key: 'MEDIUM',   color: '#fbbf24' },
-  ]
-  const maxSev = Math.max(...sevCounts.map(({ key }) => summary?.by_severity[key] ?? 0), 1)
+export function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
+  const { summary, summaryError, lastUpdated, refreshing, refresh, triggerAudit, auditRunning } = useAppData()
+  const now = useNow()
+  const open = summary?.by_status.OPEN ?? 0
+  const sev  = activeBySeverity(summary)
+  const max  = Math.max(1, ...SEVERITIES.map((s) => sev.counts[s] ?? 0))
+  const stale = !!summaryError
 
   return (
-    <aside
-      className="w-60 flex-shrink-0 flex flex-col h-full"
-      style={{
-        background: 'linear-gradient(180deg, #0b1019 0%, #07090f 100%)',
-        borderRight: '1px solid rgba(96,165,250,0.07)',
-      }}
-    >
-      {/* Logo */}
-      <div className="px-5 py-5" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
-        <div className="flex items-center gap-3">
-          <div
-            className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0"
-            style={{
-              background: 'linear-gradient(135deg, rgba(248,113,113,0.2) 0%, rgba(251,146,60,0.12) 100%)',
-              border: '1px solid rgba(248,113,113,0.3)',
-              boxShadow: '0 0 14px rgba(248,113,113,0.15)',
-            }}
-          >
-            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="#f87171" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M8 1.5L2 4v4.5c0 3.3 2.3 5.7 6 6.8 3.7-1.1 6-3.5 6-6.8V4L8 1.5z"/>
-            </svg>
-          </div>
-          <div>
-            <div className="text-[15px] font-bold leading-tight tracking-tight">
-              Cloud<span style={{ color: '#f87171' }}>Shield</span>
-            </div>
-            <div
-              className="text-[9px] font-semibold tracking-[0.2em] uppercase mt-0.5"
-              style={{ color: 'rgba(96,165,250,0.45)' }}
-            >
-              Auditor
-            </div>
-          </div>
-        </div>
-      </div>
+    <div className="flex h-full flex-col">
+      <div className="border-b border-white/[0.04] px-5 py-5"><Logo /></div>
 
-      {/* Navigation */}
-      <nav className="flex-1 px-3 py-4 space-y-1">
-        <p
-          className="text-[9px] font-bold uppercase tracking-[0.18em] px-2 pb-2"
-          style={{ color: 'rgba(122,132,153,0.45)' }}
-        >
-          Views
-        </p>
-        <NavItem to="/violations"   label="Violations"   icon={<ShieldIcon />} count={openCount > 0 ? openCount : undefined} />
-        <NavItem to="/my-resources" label="My Resources" icon={<GridIcon />} />
-        <NavItem to="/posture"      label="Posture"      icon={<ChartIcon />} />
+      <nav aria-label="Main" className="flex-1 space-y-1 px-3 py-4">
+        <p className="eyebrow px-2 pb-2">Views</p>
+        <NavItem to="/violations"   label="Findings"     icon="shield" count={open} onNavigate={onNavigate} />
+        <NavItem to="/my-resources" label="My resources" icon="grid" onNavigate={onNavigate} />
+        <NavItem to="/posture"      label="Posture"      icon="chart" onNavigate={onNavigate} />
       </nav>
 
-      {/* Severity bars */}
-      {summary && (
-        <div className="px-4 py-4" style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }}>
-          <p
-            className="text-[9px] font-bold uppercase tracking-[0.18em] mb-3"
-            style={{ color: 'rgba(122,132,153,0.45)' }}
-          >
-            Open by severity
+      <div className="border-t border-white/[0.04] px-4 py-4">
+        <p className="eyebrow mb-3">{sev.exact ? 'Active by severity' : 'By severity'}</p>
+        <ul className="space-y-2.5">
+          {SEVERITIES.map((s) => {
+            const n = sev.counts[s] ?? 0
+            const c = SEV_STYLE[s]
+            return (
+              <li key={s}>
+                <NavLink to={`/violations?status=all&severity=${s.toLowerCase()}`} onClick={onNavigate}
+                  className="group flex items-center gap-2.5 rounded" aria-label={`${n} ${c.label.toLowerCase()} findings`}>
+                  <span className="w-[54px] text-[10px] font-semibold uppercase tracking-wide" style={{ color: c.color }}>{c.label}</span>
+                  <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-white/[0.05]">
+                    <span className="block h-full rounded-full transition-[width] duration-700 ease-out-expo"
+                      style={{ width: summary ? `${(n / max) * 100}%` : '0%', background: c.color, boxShadow: `0 0 6px ${c.color}70` }} />
+                  </span>
+                  <span className="w-6 text-right text-[11px] font-bold tabular" style={{ color: c.color }}>{summary ? n : '–'}</span>
+                </NavLink>
+              </li>
+            )
+          })}
+        </ul>
+      </div>
+
+      <div className="space-y-3 border-t border-white/[0.04] px-4 py-4">
+        {summary?.last_run && (
+          <p className="flex items-center gap-1.5 text-[11px] text-muted" title={`Finished ${new Date(summary.last_run.finished_at).toLocaleString()}`}>
+            <Icon name={summary.last_run.incomplete_scopes.length ? 'alert' : 'check'} size={11}
+              className={summary.last_run.incomplete_scopes.length ? 'text-medium' : 'text-low'} />
+            Last audit {relativeTime(summary.last_run.finished_at, now)}
+            {summary.last_run.incomplete_scopes.length > 0 && <span className="text-medium">· incomplete</span>}
           </p>
-          <div className="space-y-2">
-            {sevCounts.map(({ key, color }) => {
-              const count = summary.by_severity[key] ?? 0
-              return (
-                <div key={key} className="flex items-center gap-2">
-                  <span className="text-[10px] font-semibold w-[56px]" style={{ color }}>
-                    {key}
-                  </span>
-                  <div
-                    className="flex-1 h-1.5 rounded-full overflow-hidden"
-                    style={{ background: 'rgba(255,255,255,0.05)' }}
-                  >
-                    <div
-                      className="h-full rounded-full transition-all duration-700"
-                      style={{
-                        width: `${(count / maxSev) * 100}%`,
-                        background: `linear-gradient(90deg, ${color} 0%, ${color}90 100%)`,
-                        boxShadow: `0 0 6px ${color}50`,
-                      }}
-                    />
-                  </div>
-                  <span
-                    className="text-[11px] font-bold w-4 text-right tabular-nums"
-                    style={{ color }}
-                  >
-                    {count}
-                  </span>
-                </div>
-              )
-            })}
-          </div>
+        )}
+        <button onClick={() => void triggerAudit()} disabled={auditRunning} className="btn btn-accent w-full py-2.5">
+          {auditRunning ? <><Spinner size={13} /> Auditing…</> : <><Icon name="play" size={12} /> Run audit now</>}
+        </button>
+        <div className="flex items-center justify-between gap-2 text-[11px] text-muted">
+          <span className="flex min-w-0 items-center gap-2" title={summaryError ?? undefined}>
+            <span className={stale ? 'dot-stale' : 'dot-live'} />
+            <span className="truncate">
+              {stale ? 'Offline — showing last data' : lastUpdated ? `Updated ${relativeTime(new Date(lastUpdated).toISOString(), now)}` : 'Connecting…'}
+            </span>
+          </span>
+          <button onClick={() => void refresh()} className="btn btn-ghost btn-icon h-7 min-h-0 w-7" aria-label="Refresh data" title="Refresh">
+            <Icon name="refresh" size={13} className={refreshing ? 'animate-spin' : ''} />
+          </button>
+        </div>
+        {USE_MOCK && (
+          <p className="rounded-md border border-medium/20 bg-medium/[0.06] px-2.5 py-1.5 text-[10px] leading-relaxed text-medium/90">
+            Demo data — not connected to AWS.
+          </p>
+        )}
+        {AUTH_ENABLED && (
+          <button onClick={() => void logout()} className="btn btn-ghost w-full justify-start">
+            <Icon name="logout" size={13} /> Sign out
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+export function Sidebar() {
+  return (
+    <aside
+      className="hidden w-64 flex-shrink-0 border-r border-accent/[0.07] lg:block"
+      style={{ background: 'linear-gradient(180deg, #0b1019 0%, #07090f 100%)' }}
+    >
+      <SidebarContent />
+    </aside>
+  )
+}
+
+/** Phone/tablet: top bar with a menu button that opens the sidebar as a drawer. */
+export function MobileNav() {
+  const [open, setOpen] = useState(false)
+  const { summary } = useAppData()
+  const openCount = summary?.by_status.OPEN ?? 0
+
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [open])
+
+  return (
+    <>
+      <header className="flex flex-shrink-0 items-center justify-between border-b border-white/[0.05] bg-surface/90 px-4 py-2.5 backdrop-blur-md lg:hidden">
+        <Logo compact />
+        <button
+          className="btn btn-ghost btn-icon relative"
+          onClick={() => setOpen(true)}
+          aria-label="Open navigation"
+          aria-expanded={open}
+          aria-controls="mobile-drawer"
+        >
+          <Icon name="menu" size={18} />
+          {openCount > 0 && <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-critical shadow-[0_0_8px_#f87171]" />}
+        </button>
+      </header>
+
+      {open && (
+        <div className="fixed inset-0 z-40 lg:hidden" role="dialog" aria-modal="true" aria-label="Navigation">
+          <div className="absolute inset-0 animate-fade-in bg-black/60 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <aside
+            id="mobile-drawer"
+            className="absolute inset-y-0 left-0 w-[82%] max-w-[300px] animate-slide-in-left border-r border-white/10 shadow-2xl safe-bottom"
+            style={{ background: 'linear-gradient(180deg, #0b1019 0%, #07090f 100%)' }}
+          >
+            <button className="btn btn-ghost btn-icon absolute right-3 top-4 z-10" onClick={() => setOpen(false)} aria-label="Close navigation" autoFocus>
+              <Icon name="x" size={16} />
+            </button>
+            <SidebarContent onNavigate={() => setOpen(false)} />
+          </aside>
         </div>
       )}
-
-      {/* Run Audit */}
-      <div className="px-4 py-4" style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }}>
-        <button
-          onClick={onTriggerAudit}
-          disabled={auditRunning}
-          className="w-full py-2.5 px-3 rounded-lg text-xs font-semibold transition-all duration-200 flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
-          style={{
-            background: 'linear-gradient(135deg, rgba(96,165,250,0.15) 0%, rgba(96,165,250,0.07) 100%)',
-            color: '#60a5fa',
-            border: '1px solid rgba(96,165,250,0.25)',
-            boxShadow: '0 0 12px rgba(96,165,250,0.07)',
-          }}
-        >
-          {auditRunning ? (
-            <>
-              <span className="animate-spin text-sm leading-none">⟳</span>
-              Running…
-            </>
-          ) : (
-            <>
-              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                <path d="M10.5 6a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0z"/>
-                <path d="M6 2V1m0 10v-1M2 6H1m10 0h-1"/>
-              </svg>
-              Run Audit
-            </>
-          )}
-        </button>
-      </div>
-    </aside>
+    </>
   )
 }

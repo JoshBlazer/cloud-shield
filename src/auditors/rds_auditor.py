@@ -24,7 +24,7 @@ class RDSAuditor(BaseAuditor):
             for page in paginator.paginate():
                 resources.extend(page.get("DBInstances", []))
         except ClientError as exc:
-            log.error("rds.describe_db_instances failed", error=str(exc))
+            self.record_error("rds:DescribeDBInstances", exc)
         return resources
 
     def evaluate(

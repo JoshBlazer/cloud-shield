@@ -5,7 +5,7 @@ Serverless AWS CSPM that continuously audits your accounts against security poli
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![IaC](https://img.shields.io/badge/IaC-AWS%20SAM-FF9900?logo=amazonaws&logoColor=white)
 ![Dashboard](https://img.shields.io/badge/Dashboard-React%2018-61DAFB?logo=react&logoColor=black)
-![Tests](https://img.shields.io/badge/tests-150%20passing-4ade80)
+![Tests](https://img.shields.io/badge/tests-204%20passing-4ade80)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![CI](https://github.com/JoshBlazer/cloud-shield/actions/workflows/deploy.yml/badge.svg)](https://github.com/JoshBlazer/cloud-shield/actions/workflows/deploy.yml)
 
@@ -63,6 +63,8 @@ flowchart LR
 **Maintained summary aggregate.** Problem: the dashboard's headline counts (`GET /summary`) were a full table scan on every page load, so cost and latency grew with finding history. Decision: a single item in a small summary table holds flat counters (`total`, `status#OPEN`, `sev#HIGH`, `team#infra#OPEN`), and every lifecycle transition applies an atomic `ADD` delta to it, so the endpoint is one `GetItem`. Counters can drift, for example when TTL deletes an old resolved finding. So the auditor rebuilds the aggregate from a scan once it is older than `SUMMARY_REBUILD_HOURS` (default 24). Counter writes are best-effort, so a failed bump can never fail the lifecycle change it describes. Tradeoff: counts can be briefly off, bounded by the rebuild interval, in exchange for summary reads that don't grow with the table.
 
 **Exact cursor pagination.** Problem: `GET /violations` capped at 500 with no way to fetch the rest, and the sharded active index makes a plain `LastEvaluatedKey` insufficient. Decision: an opaque cursor that records the shard and the resume key within it. Each DynamoDB call asks only for the number of items still needed, so the resume key is exact and nothing is read and then silently dropped. Tradeoff: a filtered page can take a few round trips to fill, because DynamoDB applies `Limit` before filters.
+
+**Scans that can't read don't guess.** Problem: a read that fails with AccessDenied (a member role missing a new permission, an SCP, throttling) used to look like "setting absent", so buckets were reported unencrypted and trails missing, and, worse, every finding in a scan whose listing call failed was marked resolved and announced as fixed. Decision: auditors distinguish "not configured" from "couldn't read", skip checks whose input is unknown, and report the scan as incomplete; the handler holds back resolution for any finding in an incomplete account/region/service scope, and a crashing auditor or failed assume-role marks its scope incomplete instead of aborting the run. Tradeoff: a finding that was genuinely fixed while its scan was blind stays open until a complete scan confirms it, which is the safe side to err on for a security tool.
 
 **Alert de-noising.** Problem: a CSPM that re-alerts every finding every hour trains people to ignore it. Decision: alerts fire only on findings that are net-new relative to the pre-run snapshot. Tradeoff: the alert path depends on the persisted store being correct, which is why the write path above is conditional rather than best-effort.
 
@@ -123,12 +125,20 @@ Rules are declared in `policies.yaml`. Adding one is two steps: add the YAML ent
 # 1. One-time per account: deploy the OIDC trust stack so CI can assume a deploy role
 make bootstrap GITHUB_ORG=your-org-name
 
-# 2. Build and deploy the application stack (guided the first time, saves samconfig.toml)
+# 2. Check the templates offline (SAM transform + cfn-lint; no AWS calls)
+make validate-offline
+
+# 3. Build and deploy the application stack (guided the first time, saves samconfig.toml)
 make deploy-guided SLACK_WEBHOOK_URL=https://hooks.slack.com/...
 
-# 3. Build and publish the dashboard (reads API + Cognito config from stack outputs)
+# 4. Build and publish the dashboard (reads API + Cognito config from stack outputs)
 make dashboard-deploy
+
+# Later releases: backend first, then dashboard, in one step
+make release
 ```
+
+**Release order matters.** The dashboard's Undo/Reopen, trend chart and severity breakdown call API features that ship in the same release, so deploy the backend first (`make release` does). The dashboard also checks what the API supports and hides what it can't do, so an out-of-order deploy degrades gracefully rather than erroring. `make dashboard-deploy` uploads content-hashed assets with long-lived caching, uploads `index.html` last with `no-cache`, and invalidates it in CloudFront, so users get the new version at once and nobody is left holding an `index.html` whose assets are gone.
 
 After the first deploy, populate the secret if you didn't pass it as a parameter, and set your scan targets:
 
@@ -149,6 +159,16 @@ aws secretsmanager put-secret-value \
 
 With no targets set, the auditor scans its own account and region.
 
+**When rules are added, update the member role too.** New rules need new read permissions in `CloudShieldAuditRole`. Update it in each member account with `make member-role CENTRAL_ACCOUNT_ID=<id>` (run with that account's credentials), or update the StackSet for an organization:
+
+```bash
+aws cloudformation update-stack-set --stack-set-name cloudshield-member-role \
+  --template-body file://member-account-role.yaml --capabilities CAPABILITY_NAMED_IAM \
+  --parameters ParameterKey=CentralAccountId,ParameterValue=<id>
+```
+
+Until then nothing breaks, but the affected scans are incomplete: the auditor records every read it couldn't make (AccessDenied, throttling, a failed assume-role), gives no verdict on checks that depended on it, and **does not resolve** findings in a scope it couldn't fully read. The `IncompleteScans` metric raises the `cloudshield-incomplete-scans` alarm, and the dashboard shows which account, region and service are affected and why.
+
 ### CloudFormation parameters
 
 | Parameter | Default | Purpose |
@@ -168,16 +188,25 @@ CI/CD: every push and PR runs lint, type-check, and the test suite. The deploy j
 
 ```bash
 pip install -r requirements-dev.txt
-make test         # 150 tests, Moto-backed (no real AWS)
+make test         # 204 tests, Moto-backed (no real AWS)
 make lint         # ruff
 make type-check   # mypy
 
 python scripts/local_run.py   # simulate a full audit cycle (all 7 services) against mocked AWS
 
-cd dashboard && npm install && npm run dev   # http://localhost:5173
+cd dashboard && npm install && npm run dev   # http://localhost:5173, demo data
+
+make local-api                               # real API + auditor on http://localhost:8787 (Moto-backed)
+make dashboard-dev-real                      # dashboard wired to it on http://localhost:5173
 ```
 
-The dashboard runs against an in-memory mock API by default, so no backend is needed to explore it. Auth is a no-op when the Cognito environment variables are unset, so the SPA loads straight to the dashboard locally.
+The dashboard runs against an in-memory mock API by default, so no backend is needed to explore it. The mock follows the real API's contract (filters, cursor paging, lifecycle rules, error codes) and derives every count from one dataset, so triaging a finding moves the numbers everywhere. `make local-api` instead serves the real API Lambda against a Moto-faked AWS, seeded by a real audit, for full-stack work. Auth is a no-op when the Cognito environment variables are unset, so the SPA loads straight to the dashboard locally.
+
+**Dashboard behaviour worth knowing:**
+- Triage (acknowledge, snooze 1/7/30 days, exempt with a required reason, reopen) is optimistic in feel but server-confirmed: the card animates out only after the API accepts the change, failures leave it untouched with an explanation, and actions on open findings can be undone from the toast.
+- Filters, severity and search live in the URL, so a view can be shared or bookmarked; `/` focuses search.
+- Lists page through the API cursor with infinite scroll; counts refresh every minute while the tab is visible, and lists reload after an audit finishes or on the refresh button, without flashing skeletons.
+- Responsive down to phone width (navigation becomes a drawer), keyboard accessible (focus-trapped dialogs, arrow-key menus, visible focus), text meets WCAG AA contrast, and animations respect "reduce motion".
 
 The suite is part of the trust story, not an afterthought. It covers the violation lifecycle (including the regression and exempted-survives-reaudit edge cases), the JWT verification branches (valid id/access tokens, expired, wrong client, wrong issuer, key rotation), the Secrets Manager loader and its env fallback, write-sharding behavior, the multi-account evaluator including assume-role failure isolation, every auditor's pass and fail cases (including CloudTrail shadow-trail coverage), the summary counters through each transition and after drift, and cursor pagination across every index path.
 
@@ -213,7 +242,7 @@ src/
   handler.py      scheduled auditor entrypoint
 dashboard/        React 18 + Vite + TypeScript + Tailwind + Recharts
   src/hooks/      useAuth.ts: Cognito PKCE flow, in-memory tokens
-tests/            150 tests (Moto-backed)
+tests/            204 tests (Moto-backed)
 policies.yaml             declarative rule set
 template.yaml             SAM IaC (DynamoDB x3, Lambda, API GW, CloudFront, Cognito, SQS, Secrets)
 member-account-role.yaml  read-only role for each scanned account
@@ -228,8 +257,9 @@ Every endpoint accepts `X-Api-Key: <key>` or `Authorization: Bearer <cognito-jwt
 | GET | `/violations` | One page, filters: `?status=&severity=&team=&limit=&cursor=`. Returns `next_cursor` (null on the last page) |
 | GET | `/violations/{id}` | One violation by `violation_id` |
 | GET | `/violations/{id}/history` | Lifecycle trail, newest first |
-| PATCH | `/violations/{id}` | `{"action": "acknowledge"\|"snooze"\|"exempt"}` |
-| GET | `/summary` | Aggregate counts by status, severity, team (read from the maintained aggregate) |
+| PATCH | `/violations/{id}` | `{"action": "acknowledge"\|"snooze"\|"exempt"\|"reopen"}`. `reopen` returns 409 unless the finding is acknowledged, snoozed or exempted |
+| GET | `/summary` | Aggregate counts by status, severity, team, plus `by_severity_status` (severity x status matrix), read from the maintained aggregate; `last_run`: when the latest audit finished and which scans were incomplete |
+| GET | `/trend` | Daily active findings per severity, oldest first: `?days=` (default 14, max 90). Days with no audit run are omitted |
 | POST | `/audit/trigger` | Queue an out-of-cycle run (async, 202) |
 | POST | `/slack/interact` | Slack button callback (signature-verified) |
 
@@ -239,7 +269,8 @@ Every endpoint accepts `X-Api-Key: <key>` or `Authorization: Bearer <cognito-jwt
 - Summary counts are maintained incrementally and reconciled every `SUMMARY_REBUILD_HOURS`. The reconcile is still a full scan, just once a day rather than once per page load. A lifecycle change that lands during a rebuild can be missed until the next one.
 - Listing with no status filter, or with `RESOLVED`/`EXEMPTED`, pages through a filtered scan rather than an index.
 - KMS findings are attributed to a team through the key's `team` tag. CloudTrail and account-level findings show as `untagged`.
-- The Posture trend chart still uses sample data; there is no historical-trend endpoint yet.
+- Trend history starts when this version is deployed: the auditor records one snapshot per day, so the Posture chart shows an empty state until there are two days of data.
+- The lifecycle history records transitions (acknowledge, snooze, exempt, resolve, wake, reopen), not the initial detection, so a finding nobody has touched shows an empty history.
 - Natural next rules: GuardDuty enabled, VPC flow logs, Lambda public URLs, ELB TLS policies. Each is an additive auditor.
 
 ## License

@@ -164,7 +164,7 @@ Resources:
           AttributeDataType: String
           Required: true
           Mutable: false
-      Tags:
+      UserPoolTags:
         Project: CloudShield
         Environment: !Ref Environment
 
@@ -310,6 +310,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
                   - dynamodb:PutItem
                   - dynamodb:UpdateItem
                   - dynamodb:DeleteItem
@@ -601,6 +602,21 @@ Resources:
       AlarmActions:     [!Ref AuditAlertTopic]
       TreatMissingData: notBreaching
 
+  IncompleteScanAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:        !Sub "cloudshield-incomplete-scans-${Environment}"
+      AlarmDescription: "An audit couldn't read some account/region/service (usually a missing permission on CloudShieldAuditRole, or a failed assume-role). Findings there are held, not resolved, until it can."
+      Namespace:        CloudShield/Auditor
+      MetricName:       IncompleteScans
+      Statistic:        Maximum
+      Period:           3600
+      EvaluationPeriods: 1
+      Threshold:        1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:     [!Ref AuditAlertTopic]
+      TreatMissingData: notBreaching
+
   AuditFunctionErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -655,6 +671,9 @@ Outputs:
   DashboardBucketName:
     Description: "S3 bucket — deploy the dashboard build here"
     Value: !Ref DashboardBucket
+  DashboardDistributionId:
+    Description: "CloudFront distribution ID (used to invalidate index.html after a dashboard deploy)"
+    Value: !Ref DashboardDistribution
 
   ViolationsTableName:
     Value: !Ref ViolationsTable

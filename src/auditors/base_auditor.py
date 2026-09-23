@@ -7,11 +7,32 @@ log = structlog.get_logger()
 
 
 class BaseAuditor(ABC):
-    """Abstract base class that all cloud service auditors must implement."""
+    """
+    Abstract base class that all cloud service auditors must implement.
+
+    Auditors must never turn "couldn't read it" into a verdict. When an API call
+    fails for a reason other than "the thing doesn't exist" (AccessDenied,
+    throttling, a missing permission on a member-account role), the auditor
+    records it with `record_error` and skips the checks that depended on it. The
+    evaluator reports the scan as incomplete, and the handler then leaves that
+    service's existing findings alone instead of marking them resolved.
+    """
 
     def __init__(self, session: Any) -> None:
         self.session = session
         self._account_id: str | None = None
+        self.errors: list[str] = []
+
+    @property
+    def incomplete(self) -> bool:
+        """True if any read failed, so absence of a finding proves nothing."""
+        return bool(self.errors)
+
+    def record_error(self, operation: str, exc: Exception, **context: Any) -> None:
+        code = getattr(exc, "response", {}).get("Error", {}).get("Code", type(exc).__name__)
+        self.errors.append(f"{operation}: {code}")
+        log.warning("auditor.read_failed", auditor=type(self).__name__, operation=operation,
+                    code=code, error=str(exc), **context)
 
     @abstractmethod
     def fetch_resources(self) -> list[dict[str, Any]]:
