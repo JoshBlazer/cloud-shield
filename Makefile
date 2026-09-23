@@ -8,7 +8,8 @@ SAM     := sam
 SLACK_WEBHOOK_URL ?= REPLACE_ME
 
 .PHONY: help install lint format type-check test test-cov \
-        validate build deploy-guided deploy logs destroy bootstrap clean
+        validate build deploy-guided deploy logs destroy bootstrap clean \
+        dashboard-dev local-api dashboard-dev-real
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -105,6 +106,12 @@ DASHBOARD_URL ?= $(shell aws cloudformation describe-stacks \
 
 dashboard-dev: ## Run dashboard dev server (mock API)
 	cd dashboard && npm run dev
+
+local-api: ## Serve the real API + auditor locally on :8787 against Moto (no AWS needed)
+	$(PYTHON) scripts/local_api.py
+
+dashboard-dev-real: ## Run dashboard dev server against `make local-api`
+	cd dashboard && VITE_USE_MOCK=false VITE_API_URL=http://localhost:8787 npm run dev
 
 dashboard-build: ## Build dashboard for production (pulls API + Cognito config from stack outputs)
 	cd dashboard && \

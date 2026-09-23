@@ -1,6 +1,9 @@
 export type Severity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
 export type Status   = 'OPEN' | 'ACKNOWLEDGED' | 'SNOOZED' | 'RESOLVED' | 'EXEMPTED'
 
+export const SEVERITIES: Severity[] = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
+export const ACTIVE_STATUSES: Status[] = ['OPEN', 'ACKNOWLEDGED', 'SNOOZED']
+
 export interface Violation {
   pk:               string
   violation_id:     string
@@ -18,6 +21,7 @@ export interface Violation {
   acknowledged_by:  string | null
   acknowledged_at:  string | null
   snooze_until:     string | null
+  exempt_reason?:   string | null
   team:             string
   owner:            string | null
   region:           string
@@ -57,9 +61,22 @@ export interface Summary {
   by_status:   Record<string, number>
   by_severity: Record<string, number>
   by_team:     Record<string, Record<string, number>>
+  /** Severity x status matrix. Absent on older backends. */
+  by_severity_status?: Record<string, Record<string, number>>
+}
+
+export interface TrendPoint {
+  date:         string   // YYYY-MM-DD (UTC)
+  CRITICAL:     number
+  HIGH:         number
+  MEDIUM:       number
+  LOW:          number
+  total_active: number
 }
 
 export interface AuditTriggerResult {
   triggered: boolean
   message:   string
 }
+
+export type TriageAction = 'acknowledge' | 'snooze' | 'exempt' | 'reopen'

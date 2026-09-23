@@ -5,7 +5,7 @@ Serverless AWS CSPM that continuously audits your accounts against security poli
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![IaC](https://img.shields.io/badge/IaC-AWS%20SAM-FF9900?logo=amazonaws&logoColor=white)
 ![Dashboard](https://img.shields.io/badge/Dashboard-React%2018-61DAFB?logo=react&logoColor=black)
-![Tests](https://img.shields.io/badge/tests-150%20passing-4ade80)
+![Tests](https://img.shields.io/badge/tests-192%20passing-4ade80)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![CI](https://github.com/JoshBlazer/cloud-shield/actions/workflows/deploy.yml/badge.svg)](https://github.com/JoshBlazer/cloud-shield/actions/workflows/deploy.yml)
 
@@ -168,16 +168,25 @@ CI/CD: every push and PR runs lint, type-check, and the test suite. The deploy j
 
 ```bash
 pip install -r requirements-dev.txt
-make test         # 150 tests, Moto-backed (no real AWS)
+make test         # 192 tests, Moto-backed (no real AWS)
 make lint         # ruff
 make type-check   # mypy
 
 python scripts/local_run.py   # simulate a full audit cycle (all 7 services) against mocked AWS
 
-cd dashboard && npm install && npm run dev   # http://localhost:5173
+cd dashboard && npm install && npm run dev   # http://localhost:5173, demo data
+
+make local-api                               # real API + auditor on http://localhost:8787 (Moto-backed)
+make dashboard-dev-real                      # dashboard wired to it on http://localhost:5173
 ```
 
-The dashboard runs against an in-memory mock API by default, so no backend is needed to explore it. Auth is a no-op when the Cognito environment variables are unset, so the SPA loads straight to the dashboard locally.
+The dashboard runs against an in-memory mock API by default, so no backend is needed to explore it. The mock follows the real API's contract (filters, cursor paging, lifecycle rules, error codes) and derives every count from one dataset, so triaging a finding moves the numbers everywhere. `make local-api` instead serves the real API Lambda against a Moto-faked AWS, seeded by a real audit, for full-stack work. Auth is a no-op when the Cognito environment variables are unset, so the SPA loads straight to the dashboard locally.
+
+**Dashboard behaviour worth knowing:**
+- Triage (acknowledge, snooze 1/7/30 days, exempt with a required reason, reopen) is optimistic in feel but server-confirmed: the card animates out only after the API accepts the change, failures leave it untouched with an explanation, and actions on open findings can be undone from the toast.
+- Filters, severity and search live in the URL, so a view can be shared or bookmarked; `/` focuses search.
+- Lists page through the API cursor with infinite scroll; counts refresh every minute while the tab is visible, and lists reload after an audit finishes or on the refresh button, without flashing skeletons.
+- Responsive down to phone width (navigation becomes a drawer), keyboard accessible (focus-trapped dialogs, arrow-key menus, visible focus), text meets WCAG AA contrast, and animations respect "reduce motion".
 
 The suite is part of the trust story, not an afterthought. It covers the violation lifecycle (including the regression and exempted-survives-reaudit edge cases), the JWT verification branches (valid id/access tokens, expired, wrong client, wrong issuer, key rotation), the Secrets Manager loader and its env fallback, write-sharding behavior, the multi-account evaluator including assume-role failure isolation, every auditor's pass and fail cases (including CloudTrail shadow-trail coverage), the summary counters through each transition and after drift, and cursor pagination across every index path.
 
@@ -213,7 +222,7 @@ src/
   handler.py      scheduled auditor entrypoint
 dashboard/        React 18 + Vite + TypeScript + Tailwind + Recharts
   src/hooks/      useAuth.ts: Cognito PKCE flow, in-memory tokens
-tests/            150 tests (Moto-backed)
+tests/            192 tests (Moto-backed)
 policies.yaml             declarative rule set
 template.yaml             SAM IaC (DynamoDB x3, Lambda, API GW, CloudFront, Cognito, SQS, Secrets)
 member-account-role.yaml  read-only role for each scanned account
@@ -228,8 +237,9 @@ Every endpoint accepts `X-Api-Key: <key>` or `Authorization: Bearer <cognito-jwt
 | GET | `/violations` | One page, filters: `?status=&severity=&team=&limit=&cursor=`. Returns `next_cursor` (null on the last page) |
 | GET | `/violations/{id}` | One violation by `violation_id` |
 | GET | `/violations/{id}/history` | Lifecycle trail, newest first |
-| PATCH | `/violations/{id}` | `{"action": "acknowledge"\|"snooze"\|"exempt"}` |
-| GET | `/summary` | Aggregate counts by status, severity, team (read from the maintained aggregate) |
+| PATCH | `/violations/{id}` | `{"action": "acknowledge"\|"snooze"\|"exempt"\|"reopen"}`. `reopen` returns 409 unless the finding is acknowledged, snoozed or exempted |
+| GET | `/summary` | Aggregate counts by status, severity, team, plus `by_severity_status` (severity x status matrix), read from the maintained aggregate |
+| GET | `/trend` | Daily active findings per severity, oldest first: `?days=` (default 14, max 90). Days with no audit run are omitted |
 | POST | `/audit/trigger` | Queue an out-of-cycle run (async, 202) |
 | POST | `/slack/interact` | Slack button callback (signature-verified) |
 
@@ -239,7 +249,8 @@ Every endpoint accepts `X-Api-Key: <key>` or `Authorization: Bearer <cognito-jwt
 - Summary counts are maintained incrementally and reconciled every `SUMMARY_REBUILD_HOURS`. The reconcile is still a full scan, just once a day rather than once per page load. A lifecycle change that lands during a rebuild can be missed until the next one.
 - Listing with no status filter, or with `RESOLVED`/`EXEMPTED`, pages through a filtered scan rather than an index.
 - KMS findings are attributed to a team through the key's `team` tag. CloudTrail and account-level findings show as `untagged`.
-- The Posture trend chart still uses sample data; there is no historical-trend endpoint yet.
+- Trend history starts when this version is deployed: the auditor records one snapshot per day, so the Posture chart shows an empty state until there are two days of data.
+- The lifecycle history records transitions (acknowledge, snooze, exempt, resolve, wake, reopen), not the initial detection, so a finding nobody has touched shows an empty history.
 - Natural next rules: GuardDuty enabled, VPC flow logs, Lambda public URLs, ELB TLS policies. Each is an additive auditor.
 
 ## License
