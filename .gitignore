@@ -24,6 +24,7 @@ report_screenshot.png
 dash_*.png
 
 # Local environment
+.venv/
 .env
 .env.*
 !.env.example

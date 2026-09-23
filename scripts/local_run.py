@@ -27,6 +27,9 @@ os.environ.update(
         "SNS_TOPIC_ARN": "",          # set after topic creation below
         "CLOUDWATCH_NAMESPACE": "CloudShield/Auditor",
         "AWS_REGION": "us-east-1",
+        "VIOLATIONS_TABLE": "cloudshield-violations-local",
+        "AUDIT_LOG_TABLE": "cloudshield-audit-log-local",
+        "SUMMARY_TABLE": "cloudshield-summary-local",
     }
 )
 
@@ -139,6 +142,93 @@ def seed_violations(session):
 
     # No password policy set → IAM_003 fires
 
+    # ── RDS ───────────────────────────────────────────────────────────────
+    # Public, unencrypted, 1-day backups → RDS_001 / RDS_002 / RDS_003
+    session.client("rds").create_db_instance(
+        DBInstanceIdentifier="legacy-reporting-db",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="Temp1234!",
+        AllocatedStorage=20,
+        PubliclyAccessible=True,
+        StorageEncrypted=False,
+        BackupRetentionPeriod=1,
+        Tags=[{"Key": "team", "Value": "data-platform"}],
+    )
+
+    # ── KMS ───────────────────────────────────────────────────────────────
+    # Customer-managed key without rotation → KMS_001
+    session.client("kms").create_key(Description="payments data key")
+
+    # ── EBS ───────────────────────────────────────────────────────────────
+    # Encryption-by-default off (EBS_002), an unencrypted volume (EBS_001),
+    # and a snapshot of it shared publicly (EBS_003)
+    vol = ec2.create_volume(AvailabilityZone=f"{REGION}a", Size=8, Encrypted=False)
+    snap = ec2.create_snapshot(VolumeId=vol["VolumeId"], Description="db export")
+    ec2.modify_snapshot_attribute(
+        SnapshotId=snap["SnapshotId"], Attribute="createVolumePermission",
+        OperationType="add", GroupNames=["all"],
+    )
+
+    # ── CloudTrail ────────────────────────────────────────────────────────
+    # No trail at all → CT_001
+
+
+def seed_tables(session):
+    """Create the DynamoDB tables the SAM template defines (same keys and indexes)."""
+    ddb = session.resource("dynamodb")
+    ddb.create_table(
+        TableName=os.environ["VIOLATIONS_TABLE"],
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[
+            {"AttributeName": n, "AttributeType": "S"}
+            for n in ("pk", "violation_id", "active_pk", "team", "last_seen")
+        ],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "violation-id-index",
+                "KeySchema": [{"AttributeName": "violation_id", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+            {
+                "IndexName": "active-pk-index",
+                "KeySchema": [
+                    {"AttributeName": "active_pk", "KeyType": "HASH"},
+                    {"AttributeName": "last_seen", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+            {
+                "IndexName": "team-index",
+                "KeySchema": [
+                    {"AttributeName": "team", "KeyType": "HASH"},
+                    {"AttributeName": "last_seen", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+        ],
+    )
+    ddb.create_table(
+        TableName=os.environ["AUDIT_LOG_TABLE"],
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[
+            {"AttributeName": "violation_id", "AttributeType": "S"},
+            {"AttributeName": "timestamp", "AttributeType": "S"},
+        ],
+        KeySchema=[
+            {"AttributeName": "violation_id", "KeyType": "HASH"},
+            {"AttributeName": "timestamp", "KeyType": "RANGE"},
+        ],
+    )
+    ddb.create_table(
+        TableName=os.environ["SUMMARY_TABLE"],
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+    )
+
 
 def seed_sns(session):
     sns = session.client("sns", region_name=REGION)
@@ -157,6 +247,7 @@ def main():
         print(DIVIDER)
 
         print("\n[setup] Seeding violations into fake AWS environment...")
+        seed_tables(session)
         seed_violations(session)
         sns_arn = seed_sns(session)
         print(f"[setup] SNS topic: {sns_arn}")
@@ -192,6 +283,9 @@ def main():
                               f"{v['resource_id']}")
                         print(f"           {v['reason']}")
 
+        from src.store import violations as store
+        summary = store.get_summary(session)
+        print(f"\n  Stored summary: {summary['total']} tracked, by status {summary['by_status']}")
         print()
 
 

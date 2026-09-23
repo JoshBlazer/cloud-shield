@@ -59,7 +59,30 @@ Resources:
                 Action:
                   - ec2:DescribeSecurityGroups
                   - ec2:DescribeTags
+                  - ec2:GetEbsEncryptionByDefault
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeSnapshotAttribute
                   - ec2:DescribeRegions
+                Resource: "*"
+              - Sid: CloudTrailReadAccess
+                Effect: Allow
+                Action:
+                  - cloudtrail:DescribeTrails
+                  - cloudtrail:GetTrailStatus
+                Resource: "*"
+              - Sid: RDSReadAccess
+                Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                Resource: "*"
+              - Sid: KMSReadAccess
+                Effect: Allow
+                Action:
+                  - kms:ListKeys
+                  - kms:DescribeKey
+                  - kms:GetKeyRotationStatus
+                  - kms:ListResourceTags
                 Resource: "*"
               - Sid: IAMReadAccess
                 Effect: Allow

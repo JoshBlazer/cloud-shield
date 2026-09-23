@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
-import { mockApi } from './api/mock'
+import { api } from './api/client'
 import { Sidebar } from './components/Sidebar'
 import { AUTH_ENABLED, isAuthenticated, login } from './hooks/useAuth'
 import type { Summary } from './types'
@@ -41,14 +41,14 @@ export default function App() {
   const [auditRunning, setAuditRunning] = useState(false)
   const [auditMsg, setAuditMsg]         = useState<string | null>(null)
 
-  const loadSummary = () => { mockApi.getSummary().then(setSummary) }
+  const loadSummary = () => { api.getSummary().then(setSummary) }
   useEffect(() => { loadSummary() }, [])
 
   const handleTriggerAudit = async () => {
     setAuditRunning(true)
     setAuditMsg(null)
     try {
-      const r = await mockApi.triggerAudit()
+      const r = await api.triggerAudit()
       setAuditMsg(r.message)
       loadSummary()
     } finally {

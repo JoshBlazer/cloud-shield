@@ -178,14 +178,22 @@ def _list_violations(event: dict[str, Any], **_: Any) -> dict[str, Any]:
         limit = max(1, min(500, int(qs.get("limit", 200))))
     except (ValueError, TypeError):
         limit = 200
-    items = store.list_violations(
-        _session(),
-        status=qs.get("status"),
-        severity=qs.get("severity"),
-        team=qs.get("team"),
-        limit=limit,
+    origin = event.get("_origin", "")
+    try:
+        items, next_cursor = store.list_violations_page(
+            _session(),
+            status=qs.get("status"),
+            severity=qs.get("severity"),
+            team=qs.get("team"),
+            limit=limit,
+            cursor=qs.get("cursor") or None,
+        )
+    except store.InvalidCursorError:
+        return _err("invalid cursor", origin=origin)
+    return _ok(
+        {"violations": items, "count": len(items), "next_cursor": next_cursor},
+        origin=origin,
     )
-    return _ok({"violations": items, "count": len(items)}, origin=event.get("_origin", ""))
 
 
 def _get_violation(event: dict[str, Any], violation_id: str) -> dict[str, Any]:

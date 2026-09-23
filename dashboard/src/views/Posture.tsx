@@ -5,7 +5,8 @@ import {
   CartesianGrid, Legend,
   ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
-import { mockApi, MOCK_TREND } from '../api/mock'
+import { api } from '../api/client'
+import { MOCK_TREND } from '../api/mock'
 import type { Summary } from '../types'
 
 function ComplianceRing({ score }: { score: number }) {
@@ -64,7 +65,7 @@ export function Posture() {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    mockApi.getSummary().then((s) => { setSummary(s); setLoading(false) })
+    api.getSummary().then((s) => { setSummary(s); setLoading(false) })
   }, [])
 
   if (loading || !summary) {

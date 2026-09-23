@@ -11,8 +11,12 @@ import structlog
 import yaml
 
 from src.auditors.base_auditor import BaseAuditor
+from src.auditors.cloudtrail_auditor import CloudTrailAuditor
+from src.auditors.ebs_auditor import EBSAuditor
 from src.auditors.ec2_auditor import EC2Auditor
 from src.auditors.iam_auditor import IAMAuditor
+from src.auditors.kms_auditor import KMSAuditor
+from src.auditors.rds_auditor import RDSAuditor
 from src.auditors.s3_auditor import S3Auditor
 
 log = structlog.get_logger()
@@ -26,6 +30,10 @@ _AUDITOR_MAP: dict[str, Callable[[Any], BaseAuditor]] = {
     "s3":  S3Auditor,
     "ec2": EC2Auditor,
     "iam": IAMAuditor,
+    "cloudtrail": CloudTrailAuditor,
+    "rds": RDSAuditor,
+    "kms": KMSAuditor,
+    "ebs": EBSAuditor,
 }
 
 

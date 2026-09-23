@@ -24,6 +24,24 @@ export interface Violation {
   account_id:       string
 }
 
+export interface ViolationQuery {
+  status?:   string
+  severity?: string
+  team?:     string
+  /** Page size, 1–500. Server default is 200. */
+  limit?:    number
+  /** Opaque cursor from a previous page's `next_cursor`. Only valid with the same filters. */
+  cursor?:   string
+}
+
+export interface ViolationPage {
+  violations:  Violation[]
+  /** Number of items in this page. */
+  count:       number
+  /** Pass back as `cursor` to fetch the next page; null when there are no more results. */
+  next_cursor: string | null
+}
+
 export interface AuditEvent {
   violation_id: string
   timestamp:    string

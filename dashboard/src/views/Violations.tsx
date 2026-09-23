@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
-import { mockApi } from '../api/mock'
+import { useState } from 'react'
+import { api } from '../api/client'
+import { LoadMore } from '../components/LoadMore'
 import { ViolationCard } from '../components/ViolationCard'
+import { usePaginatedViolations } from '../hooks/usePaginatedViolations'
 import type { Severity, Status, Violation } from '../types'
 
 const SEVERITIES: Severity[] = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
@@ -21,29 +23,29 @@ const STATUS_THEME: Record<string, { active: { bg: string; color: string; shadow
 }
 
 export function Violations() {
-  const [violations, setViolations] = useState<Violation[]>([])
-  const [loading, setLoading]       = useState(true)
   const [statusFilter, setStatus]   = useState<Status | ''>('OPEN')
   const [sevFilter, setSev]         = useState<Severity | ''>('')
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const data = await mockApi.listViolations({
-        status:   statusFilter || undefined,
-        severity: sevFilter    || undefined,
-      })
-      setViolations(data.violations)
-    } finally {
-      setLoading(false)
-    }
-  }, [statusFilter, sevFilter])
+  // Changing either filter resets to the first page (handled inside the hook).
+  const {
+    violations, loading, loadingMore, error, hasMore, loadMore, applyStatusChange,
+  } = usePaginatedViolations({
+    status:   statusFilter || undefined,
+    severity: sevFilter    || undefined,
+  })
 
-  useEffect(() => { load() }, [load])
-
-  const handleAcknowledge = async (id: string) => { await mockApi.acknowledge(id); load() }
-  const handleSnooze      = async (id: string, days: number) => { await mockApi.snooze(id, days); load() }
-  const handleExempt      = async (id: string) => { await mockApi.exempt(id, 'Manually exempted from dashboard'); load() }
+  const handleAcknowledge = async (id: string) => {
+    await api.acknowledge(id)
+    applyStatusChange(id, { status: 'ACKNOWLEDGED', acknowledged_by: 'dashboard-user', acknowledged_at: new Date().toISOString() })
+  }
+  const handleSnooze = async (id: string, days: number) => {
+    await api.snooze(id, days)
+    applyStatusChange(id, { status: 'SNOOZED', snooze_until: new Date(Date.now() + days * 86_400_000).toISOString() })
+  }
+  const handleExempt = async (id: string) => {
+    await api.exempt(id, 'Manually exempted from dashboard')
+    applyStatusChange(id, { status: 'EXEMPTED' })
+  }
 
   const grouped: Record<Severity, Violation[]> = { CRITICAL: [], HIGH: [], MEDIUM: [], LOW: [] }
   for (const v of violations) grouped[v.severity]?.push(v)
@@ -113,7 +115,9 @@ export function Violations() {
         </select>
 
         <span className="ml-auto text-xs tabular-nums" style={{ color: '#4b5568' }}>
-          {loading ? 'Loading…' : `${violations.length} violation${violations.length !== 1 ? 's' : ''}`}
+          {loading
+            ? 'Loading…'
+            : `${violations.length}${hasMore ? '+' : ''} violation${violations.length !== 1 || hasMore ? 's' : ''}${hasMore ? ' · more available' : ''}`}
         </span>
       </div>
 
@@ -121,6 +125,8 @@ export function Violations() {
       <div className="flex-1 overflow-y-auto px-6 py-5 space-y-6">
         {loading ? (
           <div className="text-center py-16" style={{ color: '#4b5568' }}>Loading violations…</div>
+        ) : error && violations.length === 0 ? (
+          <div className="text-center py-16 text-xs" style={{ color: '#f87171' }}>Failed to load violations: {error}</div>
         ) : violations.length === 0 ? (
           <div className="text-center py-20">
             <div
@@ -135,7 +141,8 @@ export function Violations() {
             <p className="text-xs mt-1" style={{ color: '#4b5568' }}>Try a different status or severity</p>
           </div>
         ) : (
-          SEVERITIES.map((sev) => {
+          <>
+          {SEVERITIES.map((sev) => {
             const items = grouped[sev]
             if (!items.length) return null
             const t = SEV_THEME[sev]
@@ -179,7 +186,15 @@ export function Violations() {
                 </div>
               </section>
             )
-          })
+          })}
+          <LoadMore
+            loaded={violations.length}
+            hasMore={hasMore}
+            loadingMore={loadingMore}
+            error={error}
+            onLoadMore={loadMore}
+          />
+          </>
         )}
       </div>
     </div>
