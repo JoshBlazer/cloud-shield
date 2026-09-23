@@ -30,17 +30,22 @@ class IAMAuditor(BaseAuditor):
 
     # ── Credential report ─────────────────────────────────────────────────────
 
-    def _get_credential_report(self) -> list[dict[str, str]]:
+    def _get_credential_report(self) -> list[dict[str, str]] | None:
         """
         Generate + download the IAM credential report.
-        Returns the CSV rows as a list of dicts, or [] on timeout.
+        Returns the CSV rows as a list of dicts, or None if it couldn't be read
+        (access denied, or still generating after 30s).
 
         AWS may return State=STARTED or INPROGRESS, and get_credential_report()
         raises ReportInProgress until generation is done. Poll by attempting the
         get() directly — this is simpler and works with moto (which returns a
         usable report immediately regardless of the generate() state).
         """
-        self._client.generate_credential_report()  # trigger generation (idempotent)
+        try:
+            self._client.generate_credential_report()  # trigger generation (idempotent)
+        except ClientError as exc:
+            self.record_error("iam:GenerateCredentialReport", exc)
+            return None
         deadline = _time.time() + 30
         while True:
             try:
@@ -49,10 +54,11 @@ class IAMAuditor(BaseAuditor):
             except ClientError as exc:
                 code = exc.response["Error"]["Code"]
                 if code not in ("ReportInProgress", "ReportNotPresent"):
-                    raise
+                    self.record_error("iam:GetCredentialReport", exc)
+                    return None
                 if _time.time() >= deadline:
-                    log.warning("iam.credential_report_timeout")
-                    return []
+                    self.record_error("iam:GetCredentialReport", TimeoutError("report still generating after 30s"))
+                    return None
                 _time.sleep(2)
 
     @staticmethod
@@ -74,19 +80,19 @@ class IAMAuditor(BaseAuditor):
             log.warning("iam.list_user_tags failed", username=username, error=str(exc))
             return {}
 
-    def _is_root_mfa_active(self) -> bool:
-        """Fallback for when the credential report omits the root account row."""
+    def _is_root_mfa_active(self) -> bool | None:
+        """Fallback for when the credential report omits the root account row. None = unknown."""
         try:
             return bool(self._client.get_account_summary()
                         .get("SummaryMap", {}).get("AccountMFAEnabled", 0))
         except ClientError as exc:
-            log.warning("iam.get_account_summary failed", error=str(exc))
-            return True  # assume compliant to avoid false positives
+            self.record_error("iam:GetAccountSummary", exc)
+            return None
 
     # ── Resource fetching ─────────────────────────────────────────────────────
 
     def fetch_resources(self) -> list[dict[str, Any]]:
-        report = self._get_credential_report()
+        report = self._get_credential_report() or []
         # Don't early-return on empty report — account-level resources are always appended below.
         user_rows = [r for r in report if r.get("user") != "<root_account>"]
         usernames = [r["user"] for r in user_rows]
@@ -142,15 +148,16 @@ class IAMAuditor(BaseAuditor):
         resources.append({"type": "account", "password_policy": self._get_password_policy()})
         return resources
 
-    def _get_password_policy(self) -> dict[str, Any]:
+    def _get_password_policy(self) -> dict[str, Any] | None:
+        """The account password policy, {} if none is set, or None if it couldn't be read."""
         try:
             policy: dict[str, Any] = self._client.get_account_password_policy().get("PasswordPolicy", {})
             return policy
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "NoSuchEntity":
                 return {}
-            log.warning("iam.get_account_password_policy failed", error=str(exc))
-            return {}
+            self.record_error("iam:GetAccountPasswordPolicy", exc)
+            return None
 
     # ── Evaluation ────────────────────────────────────────────────────────────
 
@@ -197,6 +204,8 @@ class IAMAuditor(BaseAuditor):
 
             elif check == "weak_password_policy":
                 policy  = account.get("password_policy", {})
+                if policy is None:
+                    continue  # couldn't read it: no verdict
                 reasons = self._audit_password_policy(rule, policy)
                 if reasons:
                     violations.append(
@@ -207,7 +216,7 @@ class IAMAuditor(BaseAuditor):
                     )
 
             elif check == "root_mfa_disabled":
-                if not acct_summary.get("root_mfa_active", True):
+                if acct_summary.get("root_mfa_active", True) is False:
                     violations.append(
                         self._build_violation(
                             rule, "root", "AWS::IAM::RootAccount",

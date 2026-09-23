@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Icon } from '../components/Icon'
 import { PageHeader, Segmented } from '../components/PageHeader'
+import { ScanHealthBanner } from '../components/ScanHealth'
 import { EmptyState } from '../components/States'
 import { ViolationList } from '../components/ViolationList'
 import { usePaginatedViolations } from '../hooks/usePaginatedViolations'
@@ -126,6 +127,7 @@ export function Violations() {
 
       <div className="flex-1 overflow-y-auto px-4 pb-10 pt-4 sm:px-6">
         <div className="mx-auto max-w-5xl">
+          <ScanHealthBanner />
           <ViolationList
             list={list}
             query={query}

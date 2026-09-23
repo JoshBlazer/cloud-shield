@@ -8,7 +8,7 @@
  */
 import { RULES } from '../lib/catalog'
 import type {
-  AuditEvent, AuditTriggerResult, Severity, Status, Summary, TrendPoint, Violation,
+  AuditEvent, AuditTriggerResult, LastRun, Severity, Status, Summary, TrendPoint, Violation,
   ViolationPage, ViolationQuery,
 } from '../types'
 import { ACTIVE_STATUSES } from '../types'
@@ -245,6 +245,11 @@ function decodeCursor(token: string): { k: CursorKey; f: string } | null {
 // ── Public mock API (same shape as the HTTP client) ─────────────────────────
 
 let auditRuns = 0
+let lastRun: LastRun = {
+  finished_at: new Date(NOW_AT_LOAD - 20 * 60_000).toISOString(),
+  duration_ms: 41_200, resources_audited: 214, findings: 0, new: 0, resolved: 1, held_back: 0,
+  incomplete_scopes: [],
+}
 
 export const mockApi = {
   listViolations(params: ViolationQuery = {}): Promise<ViolationPage> {
@@ -306,7 +311,11 @@ export const mockApi = {
   },
 
   getSummary(): Promise<Summary> {
-    const s: Summary = { total: 0, by_status: {}, by_severity: {}, by_team: {}, by_severity_status: {} }
+    const active = violations.filter((v) => ACTIVE_STATUSES.includes(v.status)).length
+    const s: Summary = {
+      total: 0, by_status: {}, by_severity: {}, by_team: {}, by_severity_status: {},
+      last_run: { ...lastRun, findings: lastRun.findings || active },
+    }
     for (const v of violations) {
       s.total++
       s.by_status[v.status]     = (s.by_status[v.status] ?? 0) + 1
@@ -331,6 +340,10 @@ export const mockApi = {
       const now = new Date().toISOString()
       violations = violations.map((v) => ACTIVE_STATUSES.includes(v.status)
         ? { ...v, last_seen: now, occurrence_count: v.occurrence_count + 1 } : v)
+      lastRun = {
+        ...lastRun, finished_at: now, new: auditRuns === 1 ? 1 : 0, resolved: 0,
+        findings: violations.filter((v) => ACTIVE_STATUSES.includes(v.status)).length + (auditRuns === 1 ? 1 : 0),
+      }
       if (auditRuns === 1) {
         const id = `sg-0${hex(16)}`
         const v: Violation = {

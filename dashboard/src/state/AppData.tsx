@@ -7,7 +7,20 @@ const AUTO_REFRESH_MS = 60_000
 // After an audit is queued, re-read the summary a few times while it runs.
 const AUDIT_POLL_MS   = [4_000, 10_000, 25_000]
 
+/**
+ * What the connected backend supports. The dashboard can be deployed ahead of
+ * (or without) the matching API; rather than erroring, it hides what the server
+ * can't do. /summary's `by_severity_status` shipped together with `reopen` and
+ * `/trend`, so it marks a backend that has all three.
+ */
+export interface Features {
+  reopen:  boolean
+  trend:   boolean
+  lastRun: boolean
+}
+
 interface AppData {
+  features:     Features
   summary:      Summary | null
   summaryError: string | null
   lastUpdated:  number | null
@@ -109,10 +122,17 @@ export function AppDataProvider({ children }: { children: React.ReactNode }) {
     }
   }, [refresh, toast])
 
+  const features = useMemo<Features>(() => ({
+    // Until the first summary arrives, assume the current API (no flicker).
+    reopen:  !summary || summary.by_severity_status !== undefined,
+    trend:   !summary || summary.by_severity_status !== undefined,
+    lastRun: !summary || summary.last_run !== undefined,
+  }), [summary])
+
   const value = useMemo<AppData>(() => ({
-    summary, summaryError, lastUpdated, refreshing, dataVersion,
+    features, summary, summaryError, lastUpdated, refreshing, dataVersion,
     refresh, countsChanged, triggerAudit, auditRunning,
-  }), [summary, summaryError, lastUpdated, refreshing, dataVersion, refresh, countsChanged, triggerAudit, auditRunning])
+  }), [features, summary, summaryError, lastUpdated, refreshing, dataVersion, refresh, countsChanged, triggerAudit, auditRunning])
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }

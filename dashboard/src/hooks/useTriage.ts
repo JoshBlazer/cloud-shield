@@ -22,7 +22,7 @@ const CLEARED = { acknowledged_by: null, acknowledged_at: null, snooze_until: nu
  */
 export function useTriage(list: List) {
   const toast = useToast()
-  const { countsChanged } = useAppData()
+  const { countsChanged, features } = useAppData()
   const [busy, setBusy]       = useState<ReadonlySet<string>>(new Set())
   const [leaving, setLeaving] = useState<ReadonlySet<string>>(new Set())
 
@@ -101,11 +101,11 @@ export function useTriage(list: List) {
       tone: 'success',
       title,
       detail: `${v.rule_name} · ${v.resource_id.length > 48 ? `…${v.resource_id.slice(-46)}` : v.resource_id}`,
-      action: v.status === 'OPEN' && action !== 'reopen'
+      action: features.reopen && v.status === 'OPEN' && action !== 'reopen'
         ? { label: 'Undo', run: () => undo(v, index) }
         : undefined,
     })
-  }, [busy, list, settle, countsChanged, toast, undo])
+  }, [busy, list, settle, countsChanged, toast, undo, features.reopen])
 
   return { run, busy, leaving }
 }

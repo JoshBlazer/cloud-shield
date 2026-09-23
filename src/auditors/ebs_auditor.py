@@ -26,14 +26,14 @@ class EBSAuditor(BaseAuditor):
             enabled = self._client.get_ebs_encryption_by_default().get("EbsEncryptionByDefault")
             resources.append({"_kind": "account", "EbsEncryptionByDefault": bool(enabled)})
         except ClientError as exc:
-            log.error("ebs.get_ebs_encryption_by_default failed", error=str(exc))
+            self.record_error("ec2:GetEbsEncryptionByDefault", exc)
 
         try:
             for page in self._client.get_paginator("describe_volumes").paginate():
                 for vol in page.get("Volumes", []):
                     resources.append({"_kind": "volume", **vol})
         except ClientError as exc:
-            log.error("ebs.describe_volumes failed", error=str(exc))
+            self.record_error("ec2:DescribeVolumes", exc)
 
         try:
             pages = self._client.get_paginator("describe_snapshots").paginate(OwnerIds=["self"])
@@ -42,18 +42,18 @@ class EBSAuditor(BaseAuditor):
                     snap["IsPublic"] = self._snapshot_is_public(snap["SnapshotId"])
                     resources.append({"_kind": "snapshot", **snap})
         except ClientError as exc:
-            log.error("ebs.describe_snapshots failed", error=str(exc))
+            self.record_error("ec2:DescribeSnapshots", exc)
 
         return resources
 
-    def _snapshot_is_public(self, snapshot_id: str) -> bool:
+    def _snapshot_is_public(self, snapshot_id: str) -> bool | None:
         try:
             attr = self._client.describe_snapshot_attribute(
                 SnapshotId=snapshot_id, Attribute="createVolumePermission"
             )
         except ClientError as exc:
-            log.warning("ebs.describe_snapshot_attribute failed", snapshot=snapshot_id, error=str(exc))
-            return False
+            self.record_error("ec2:DescribeSnapshotAttribute", exc, snapshot=snapshot_id)
+            return None
         return any(p.get("Group") == "all" for p in attr.get("CreateVolumePermissions", []))
 
     def evaluate(

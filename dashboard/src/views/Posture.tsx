@@ -7,6 +7,7 @@ import { api, errorMessage } from '../api/client'
 import { AnimatedNumber } from '../components/AnimatedNumber'
 import { Icon } from '../components/Icon'
 import { PageHeader } from '../components/PageHeader'
+import { ScanHealthBanner } from '../components/ScanHealth'
 import { ErrorState } from '../components/States'
 import { SEV_STYLE, STATUS_STYLE } from '../lib/catalog'
 import { shortDate } from '../lib/format'
@@ -73,20 +74,21 @@ function TrendTooltip({ active, payload, label }: { active?: boolean; payload?: 
 }
 
 function TrendPanel() {
-  const { dataVersion } = useAppData()
+  const { dataVersion, features } = useAppData()
   const [days, setDays]   = useState(14)
   const [data, setData]   = useState<TrendPoint[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
+    if (!features.trend) return
     let live = true
     setError(null)
     api.getTrend(days)
       .then((r) => { if (live) setData(r.days) })
       .catch((e) => { if (live) setError(errorMessage(e)) })
     return () => { live = false }
-  }, [days, dataVersion, attempt])
+  }, [days, dataVersion, attempt, features.trend])
 
   const first = data?.[0]?.total_active ?? 0
   const last  = data?.[data.length - 1]?.total_active ?? 0
@@ -120,7 +122,13 @@ function TrendPanel() {
         </div>
       </div>
 
-      {error ? (
+      {!features.trend ? (
+        <div className="flex h-[240px] flex-col items-center justify-center text-center">
+          <Icon name="chart" size={22} className="mb-3 text-faint" />
+          <p className="text-sm font-medium text-subtle">Trend history needs the latest API</p>
+          <p className="mt-1 max-w-xs text-xs text-muted">Deploy the current backend (<code className="font-mono">make release</code>); daily snapshots start with its first audit.</p>
+        </div>
+      ) : error ? (
         <ErrorState title="Couldn't load the trend" detail={error} onRetry={() => { setData(null); setAttempt((n) => n + 1) }} />
       ) : !data ? (
         <div className="skeleton h-[240px] w-full" />
@@ -205,6 +213,7 @@ export function Posture() {
     <div className="flex h-full flex-col overflow-hidden">
       <PageHeader title="Posture" subtitle="How your accounts are doing, and whether it's getting better." />
       <div className="flex-1 overflow-y-auto px-4 pb-10 pt-5 sm:px-6">
+        <div className="mx-auto max-w-6xl"><ScanHealthBanner /></div>
         <div className="stagger mx-auto max-w-6xl space-y-5">
           {/* Hero: resolution rate + lifecycle tiles */}
           <section className="panel flex flex-col gap-6 p-5 md:flex-row md:items-center">

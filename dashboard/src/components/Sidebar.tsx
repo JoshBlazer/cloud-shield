@@ -106,6 +106,14 @@ export function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
       </div>
 
       <div className="space-y-3 border-t border-white/[0.04] px-4 py-4">
+        {summary?.last_run && (
+          <p className="flex items-center gap-1.5 text-[11px] text-muted" title={`Finished ${new Date(summary.last_run.finished_at).toLocaleString()}`}>
+            <Icon name={summary.last_run.incomplete_scopes.length ? 'alert' : 'check'} size={11}
+              className={summary.last_run.incomplete_scopes.length ? 'text-medium' : 'text-low'} />
+            Last audit {relativeTime(summary.last_run.finished_at, now)}
+            {summary.last_run.incomplete_scopes.length > 0 && <span className="text-medium">· incomplete</span>}
+          </p>
+        )}
         <button onClick={() => void triggerAudit()} disabled={auditRunning} className="btn btn-accent w-full py-2.5">
           {auditRunning ? <><Spinner size={13} /> Auditing…</> : <><Icon name="play" size={12} /> Run audit now</>}
         </button>

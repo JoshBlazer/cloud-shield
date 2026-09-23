@@ -27,7 +27,7 @@ class EC2Auditor(BaseAuditor):
                     resources.append(sg)
                     log.debug("ec2.fetched_sg", sg_id=sg["GroupId"])
         except ClientError as exc:
-            log.error("ec2.describe_security_groups failed", error=str(exc))
+            self.record_error("ec2:DescribeSecurityGroups", exc)
 
         return resources
 

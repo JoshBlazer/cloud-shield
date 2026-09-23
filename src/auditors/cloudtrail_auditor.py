@@ -26,7 +26,7 @@ class CloudTrailAuditor(BaseAuditor):
             # only run where the trail is homed so each trail is judged once.
             trails = self._client.describe_trails(includeShadowTrails=True).get("trailList", [])
         except ClientError as exc:
-            log.error("cloudtrail.describe_trails failed", error=str(exc))
+            self.record_error("cloudtrail:DescribeTrails", exc)
             return resources
 
         for trail in trails:
@@ -35,8 +35,8 @@ class CloudTrailAuditor(BaseAuditor):
                 status = self._client.get_trail_status(Name=trail["TrailARN"])
                 trail["IsLogging"] = bool(status.get("IsLogging"))
             except ClientError as exc:
-                log.warning("cloudtrail.get_trail_status failed", trail=trail.get("Name"), error=str(exc))
-                trail["IsLogging"] = False
+                self.record_error("cloudtrail:GetTrailStatus", exc, trail=trail.get("Name"))
+                trail["IsLogging"] = None  # unknown
             resources.append(trail)
         return resources
 
@@ -50,6 +50,9 @@ class CloudTrailAuditor(BaseAuditor):
             check = rule.get("check")
 
             if check == "cloudtrail_not_enabled":
+                # "No trail" is only a finding if we could actually see the trails.
+                if self.incomplete:
+                    continue
                 covered = any(
                     t.get("IsLogging") and (t.get("IsMultiRegionTrail") or t.get("IsHome", True))
                     for t in resources

@@ -63,6 +63,27 @@ export interface Summary {
   by_team:     Record<string, Record<string, number>>
   /** Severity x status matrix. Absent on older backends. */
   by_severity_status?: Record<string, Record<string, number>>
+  /** Latest audit run. Absent on older backends; null before the first run. */
+  last_run?: LastRun | null
+}
+
+export interface IncompleteScope {
+  account_id: string
+  region:     string
+  service:    string
+  errors:     string[]
+}
+
+export interface LastRun {
+  finished_at:       string
+  duration_ms:       number
+  resources_audited: number
+  findings:          number
+  new:               number
+  resolved:          number
+  /** Findings kept open because their scan couldn't read everything. */
+  held_back:         number
+  incomplete_scopes: IncompleteScope[]
 }
 
 export interface TrendPoint {

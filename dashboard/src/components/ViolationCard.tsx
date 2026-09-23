@@ -15,6 +15,8 @@ interface Props {
   onAction:  (v: Violation, action: TriageAction, arg?: number | string) => void
   /** Open the "how to fix" panel by default (the My Resources view does). */
   defaultFixOpen?: boolean
+  /** Whether the server supports reopening (older backends don't). */
+  canReopen?: boolean
 }
 
 const SNOOZE_OPTIONS = [
@@ -57,7 +59,7 @@ function CopyButton({ text }: { text: string }) {
   )
 }
 
-function ViolationCardImpl({ violation: v, busy = false, leaving = false, onAction, defaultFixOpen = false }: Props) {
+function ViolationCardImpl({ violation: v, busy = false, leaving = false, onAction, defaultFixOpen = false, canReopen = true }: Props) {
   const [detailsOpen, setDetailsOpen] = useState(defaultFixOpen)
   const [history, setHistory]         = useState<AuditEvent[] | null>(null)
   const [historyError, setHistoryErr] = useState<string | null>(null)
@@ -111,7 +113,7 @@ function ViolationCardImpl({ violation: v, busy = false, leaving = false, onActi
       <Icon name="slash" size={13} /> Exempt…
     </button>
   )
-  const reopenBtn = (
+  const reopenBtn = canReopen && (
     <button className="btn btn-secondary" disabled={busy} onClick={() => onAction(v, 'reopen')}>
       <Icon name="undo" size={13} /> Reopen
     </button>

@@ -250,7 +250,10 @@ def _patch_violation(event: dict[str, Any], violation_id: str) -> dict[str, Any]
 
 
 def _get_summary(event: dict[str, Any], **_: Any) -> dict[str, Any]:
-    return _ok(store.get_summary(_session()), origin=event.get("_origin", ""))
+    session = _session()
+    summary = store.get_summary(session)
+    summary["last_run"] = store.get_last_run(session)
+    return _ok(summary, origin=event.get("_origin", ""))
 
 
 def _get_trend(event: dict[str, Any], **_: Any) -> dict[str, Any]:

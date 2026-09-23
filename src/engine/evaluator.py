@@ -37,9 +37,31 @@ _AUDITOR_MAP: dict[str, Callable[[Any], BaseAuditor]] = {
 }
 
 
+class IncompleteScope(TypedDict):
+    """A service scan in one account/region that couldn't read everything."""
+    account_id: str
+    region:     str
+    service:    str
+    errors:     list[str]
+
+
 class AuditResult(TypedDict):
-    violations: list[dict[str, Any]]
+    violations:        list[dict[str, Any]]
     resources_audited: int
+    # Scans that hit read errors (AccessDenied, throttling, a failed assume-role).
+    # A finding in one of these scopes that wasn't re-detected may still exist,
+    # so the handler must not mark it resolved.
+    incomplete_scopes: list[IncompleteScope]
+
+
+def rule_services(path: Path | None = None) -> dict[str, str]:
+    """Map every rule_id in policies.yaml to the service key that audits it."""
+    policies = _load_policies(path) if path else _load_policies()
+    return {
+        rule["id"]: service
+        for service, rules in policies.get("rules", {}).items()
+        for rule in rules
+    }
 
 
 def _load_policies(path: Path = _POLICY_PATH) -> dict[str, Any]:
@@ -69,10 +91,11 @@ def _audit_target(
     account_id: str,
     region: str,
     rules_by_service: dict[str, list[dict[str, Any]]],
-) -> tuple[list[dict[str, Any]], int]:
-    """Run all auditors for one account/region. Returns (violations, resources_audited)."""
+) -> tuple[list[dict[str, Any]], int, list[IncompleteScope]]:
+    """Run all auditors for one account/region. Returns (violations, resources, incomplete scopes)."""
     all_violations: list[dict[str, Any]] = []
     total_resources = 0
+    incomplete: list[IncompleteScope] = []
 
     for service, rules in rules_by_service.items():
         auditor_cls = _AUDITOR_MAP.get(service)
@@ -81,11 +104,27 @@ def _audit_target(
             continue
 
         log.info("evaluator.starting_audit", service=service, account=account_id, region=region)
-        auditor   = auditor_cls(session)
-        resources = auditor.fetch_resources()
+        auditor = auditor_cls(session)
+        try:
+            resources  = auditor.fetch_resources()
+            violations = auditor.evaluate(resources, rules)
+        except Exception as exc:  # noqa: BLE001 — one broken auditor must not sink the run
+            log.error("evaluator.auditor_crashed", service=service, account=account_id,
+                      region=region, error=str(exc))
+            incomplete.append(IncompleteScope(
+                account_id=account_id, region=region, service=service,
+                errors=[f"{type(exc).__name__}: {exc}"],
+            ))
+            continue
         total_resources += len(resources)
+        if auditor.incomplete:
+            log.warning("evaluator.scan_incomplete", service=service, account=account_id,
+                        region=region, errors=auditor.errors[:5])
+            incomplete.append(IncompleteScope(
+                account_id=account_id, region=region, service=service,
+                errors=sorted(set(auditor.errors))[:10],
+            ))
 
-        violations = auditor.evaluate(resources, rules)
         # Tag every violation with the account and region it came from
         for v in violations:
             v.setdefault("account_id", account_id)
@@ -98,7 +137,7 @@ def _audit_target(
         )
         all_violations.extend(violations)
 
-    return all_violations, total_resources
+    return all_violations, total_resources, incomplete
 
 
 def run_audit(
@@ -134,6 +173,7 @@ def run_audit(
 
     all_violations: list[dict[str, Any]] = []
     total_resources = 0
+    incomplete: list[IncompleteScope] = []
 
     default_account = os.environ.get("AWS_ACCOUNT_ID", "")
     default_region  = os.environ.get("AWS_REGION", "us-east-1")
@@ -150,10 +190,23 @@ def run_audit(
             )
         except Exception as exc:  # noqa: BLE001
             log.error("evaluator.assume_role_failed", account=account_id, role=role_arn, error=str(exc))
+            # Nothing in this account/region was scanned: every service is incomplete.
+            incomplete.extend(
+                IncompleteScope(account_id=account_id, region=region, service=service,
+                                errors=[f"sts:AssumeRole: {exc}"])
+                for service in rules_by_service
+            )
             continue
 
-        violations, resources = _audit_target(target_session, account_id, region, rules_by_service)
+        violations, resources, target_incomplete = _audit_target(
+            target_session, account_id, region, rules_by_service,
+        )
         all_violations.extend(violations)
         total_resources += resources
+        incomplete.extend(target_incomplete)
 
-    return AuditResult(violations=all_violations, resources_audited=total_resources)
+    return AuditResult(
+        violations=all_violations,
+        resources_audited=total_resources,
+        incomplete_scopes=incomplete,
+    )

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import type { usePaginatedViolations } from '../hooks/usePaginatedViolations'
 import { useTriage } from '../hooks/useTriage'
+import { useAppData } from '../state/AppData'
 import { SEV_STYLE } from '../lib/catalog'
 import { plural } from '../lib/format'
 import { SEVERITIES, type Severity, type Violation } from '../types'
@@ -25,6 +26,7 @@ function matchesQuery(v: Violation, q: string): boolean {
 
 export function ViolationList({ list, query = '', empty, defaultFixOpen }: Props) {
   const triage   = useTriage(list)
+  const { features } = useAppData()
   const sentinel = useRef<HTMLDivElement>(null)
   const { hasMore, loadMore, loadingMore, loadMoreError } = list
 
@@ -82,6 +84,7 @@ export function ViolationList({ list, query = '', empty, defaultFixOpen }: Props
                   leaving={triage.leaving.has(v.violation_id)}
                   onAction={triage.run}
                   defaultFixOpen={defaultFixOpen}
+                  canReopen={features.reopen}
                 />
               ))}
             </div>

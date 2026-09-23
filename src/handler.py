@@ -3,12 +3,13 @@
 import json
 import os
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 import boto3
 import structlog
 
-from src.engine.evaluator import run_audit
+from src.engine.evaluator import IncompleteScope, rule_services, run_audit
 from src.notifications import slack
 from src.store import violations as store
 
@@ -30,7 +31,9 @@ CLOUDWATCH_NAMESPACE = os.environ.get("CLOUDWATCH_NAMESPACE", "CloudShield/Audit
 AWS_REGION           = os.environ.get("AWS_REGION", "us-east-1")
 
 
-def _push_metrics(cw: Any, resources_audited: int, violations_found: int, duration_ms: float) -> None:
+def _push_metrics(
+    cw: Any, resources_audited: int, violations_found: int, duration_ms: float, incomplete_scans: int = 0,
+) -> None:
     try:
         cw.put_metric_data(
             Namespace=CLOUDWATCH_NAMESPACE,
@@ -38,6 +41,7 @@ def _push_metrics(cw: Any, resources_audited: int, violations_found: int, durati
                 {"MetricName": "ResourcesAudited", "Value": resources_audited, "Unit": "Count"},
                 {"MetricName": "ViolationsFound",  "Value": violations_found,  "Unit": "Count"},
                 {"MetricName": "AuditDurationMs",  "Value": duration_ms,       "Unit": "Milliseconds"},
+                {"MetricName": "IncompleteScans",  "Value": incomplete_scans,  "Unit": "Count"},
             ],
         )
         log.info("handler.metrics_pushed")
@@ -68,6 +72,24 @@ def _publish_email(sns: Any, violations: list[dict[str, Any]]) -> None:
         log.error("handler.email_publish_failed", error=str(exc))
 
 
+def _same(a: str, b: str) -> bool:
+    """Account/region match, treating a missing value as a wildcard."""
+    return not a or not b or a == "unknown" or b == "unknown" or a == b
+
+
+def _unverified(
+    scope: dict[str, str], incomplete: list[IncompleteScope], rule_service: dict[str, str],
+) -> bool:
+    """True if this finding's account/region/service scan couldn't read everything."""
+    service = rule_service.get(scope["rule_id"])
+    return any(
+        (service is None or s["service"] == service)
+        and _same(s["account_id"], scope["account_id"])
+        and _same(s["region"], scope["region"])
+        for s in incomplete
+    )
+
+
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     log.info("handler.audit_started")
     start = time.time()
@@ -82,11 +104,13 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         log.info("handler.snooze_wakeup", count=woken)
 
     # Snapshot which violations were active before this run so we can detect resolutions
-    pre_run_active_pks = store.get_active_pks(session)
+    pre_run_scopes     = store.get_active_scopes(session)
+    pre_run_active_pks = set(pre_run_scopes)
 
-    result            = run_audit(session=session)
+    result             = run_audit(session=session)
     current_violations = result["violations"]
     resources_audited  = result["resources_audited"]
+    incomplete         = result["incomplete_scopes"]
     duration_ms        = (time.time() - start) * 1000
 
     # Persist every violation found — track new vs already-known
@@ -108,8 +132,19 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 reason=v["reason"],
             )
 
-    # Violations that were active before but not found this run are now resolved
-    resolved_pks = pre_run_active_pks - found_pks
+    # Violations that were active before but not found this run are resolved —
+    # unless their scan couldn't read everything (AccessDenied, a failed
+    # assume-role): "not seen" then proves nothing, so they stay as they are.
+    missing      = pre_run_active_pks - found_pks
+    rule_service = rule_services() if incomplete else {}
+    held_back    = {pk for pk in missing if incomplete and _unverified(pre_run_scopes[pk], incomplete, rule_service)}
+    resolved_pks = missing - held_back
+    if incomplete:
+        log.error(
+            "handler.scan_incomplete",
+            scopes=[f"{s['account_id']}/{s['region']}/{s['service']}" for s in incomplete],
+            resolution_held_back=len(held_back),
+        )
     for pk in resolved_pks:
         store.mark_resolved(session, pk)
     if resolved_pks:
@@ -123,7 +158,18 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # Daily posture trend: today's active-by-severity, last run of the day wins.
     store.record_trend_snapshot(session)
 
-    _push_metrics(cw_client, resources_audited, len(current_violations), duration_ms)
+    _push_metrics(cw_client, resources_audited, len(current_violations), duration_ms, len(incomplete))
+
+    store.record_last_run(session, {
+        "finished_at":       datetime.now(tz=UTC).isoformat(),
+        "duration_ms":       int(duration_ms),
+        "resources_audited": resources_audited,
+        "findings":          len(current_violations),
+        "new":               len(new_violations),
+        "resolved":          len(resolved_pks),
+        "held_back":         len(held_back),
+        "incomplete_scopes": [dict(s) for s in incomplete],
+    })
 
     # Alert only on genuinely new violations — skip noise for already-tracked ones
     if new_violations:
@@ -143,4 +189,6 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "resolved":          len(resolved_pks),
         "resources_audited": resources_audited,
         "duration_ms":       round(duration_ms, 2),
+        "incomplete_scopes": incomplete,
+        "resolution_held_back": len(held_back),
     }

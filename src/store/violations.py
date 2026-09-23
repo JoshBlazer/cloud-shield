@@ -581,24 +581,64 @@ def list_violations(
     return items
 
 
-def get_active_pks(session: Any) -> set[str]:
-    """Return all PKs in an active status. Fans out over sharded active-pk-index, paginated."""
-    pks: set[str] = set()
+def get_active_scopes(session: Any) -> dict[str, dict[str, str]]:
+    """
+    Every active finding's pk -> {rule_id, account_id, region}: enough to tell
+    which account/region/service scan it belongs to. Fans out over the sharded
+    active-pk-index, paginated.
+    """
+    found: dict[str, dict[str, str]] = {}
     table = _table(session)
     for s in ACTIVE_STATUSES:
         for shard_key in _active_pk_shards(s):
             kwargs: dict[str, Any] = {
                 "IndexName": "active-pk-index",
                 "KeyConditionExpression": Key("active_pk").eq(shard_key),
-                "ProjectionExpression": "pk",
+                "ProjectionExpression": "pk, rule_id, account_id, #r",
+                "ExpressionAttributeNames": {"#r": "region"},
             }
             while True:
                 resp = table.query(**kwargs)
-                pks.update(item["pk"] for item in resp.get("Items", []))
+                for item in resp.get("Items", []):
+                    found[item["pk"]] = {
+                        "rule_id":    str(item.get("rule_id") or str(item["pk"]).split("#", 1)[0]),
+                        "account_id": str(item.get("account_id") or ""),
+                        "region":     str(item.get("region") or ""),
+                    }
                 if "LastEvaluatedKey" not in resp:
                     break
                 kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
-    return pks
+    return found
+
+
+def get_active_pks(session: Any) -> set[str]:
+    """Return all PKs in an active status."""
+    return set(get_active_scopes(session))
+
+
+# ── Last audit run ────────────────────────────────────────────────────────────
+
+LAST_RUN_PK = "last_run"
+
+
+def record_last_run(session: Any, run: dict[str, Any]) -> None:
+    """Store a summary of the latest audit run (best-effort) for the dashboard."""
+    try:
+        _summary_table(session).put_item(Item={"pk": LAST_RUN_PK, **run})
+    except ClientError as exc:
+        log.warning("store.last_run_write_failed", error=str(exc))
+
+
+def get_last_run(session: Any) -> dict[str, Any] | None:
+    try:
+        item = _summary_table(session).get_item(Key={"pk": LAST_RUN_PK}).get("Item")
+    except ClientError as exc:
+        log.warning("store.last_run_read_failed", error=str(exc))
+        return None
+    if not item:
+        return None
+    item.pop("pk", None)
+    return dict(item)
 
 
 def _scan_counters(session: Any) -> dict[str, int]:
