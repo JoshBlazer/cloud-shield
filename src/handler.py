@@ -115,6 +115,11 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if resolved_pks:
         log.info("handler.violations_resolved", count=len(resolved_pks))
 
+    # Counters are maintained incrementally; periodically reconcile them against
+    # the table so TTL deletes and any lost deltas don't drift forever.
+    if store.reconcile_summary_if_stale(session):
+        log.info("handler.summary_reconciled")
+
     _push_metrics(cw_client, resources_audited, len(current_violations), duration_ms)
 
     # Alert only on genuinely new violations — skip noise for already-tracked ones

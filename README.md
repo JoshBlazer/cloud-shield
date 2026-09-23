@@ -5,10 +5,9 @@ Serverless AWS CSPM that continuously audits your accounts against security poli
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![IaC](https://img.shields.io/badge/IaC-AWS%20SAM-FF9900?logo=amazonaws&logoColor=white)
 ![Dashboard](https://img.shields.io/badge/Dashboard-React%2018-61DAFB?logo=react&logoColor=black)
-![Tests](https://img.shields.io/badge/tests-104%20passing-4ade80)
+![Tests](https://img.shields.io/badge/tests-150%20passing-4ade80)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-<!-- Once pushed to GitHub, wire up the live CI badge:
-![CI](https://github.com/<owner>/cloudshield/actions/workflows/deploy.yml/badge.svg) -->
+[![CI](https://github.com/JoshBlazer/cloud-shield/actions/workflows/deploy.yml/badge.svg)](https://github.com/JoshBlazer/cloud-shield/actions/workflows/deploy.yml)
 
 ![CloudShield Violations dashboard](docs/screenshots/violations.png)
 
@@ -34,12 +33,14 @@ flowchart LR
   EVAL --> A1[S3 auditor]
   EVAL --> A2[EC2 auditor]
   EVAL --> A3[IAM auditor]
+  EVAL --> A4[CloudTrail / RDS /<br/>KMS / EBS auditors]
   EVAL -. STS assume-role .-> ACCTS[(member accounts<br/>+ regions)]
   AUD --> DDB[(DynamoDB<br/>violation store)]
   AUD --> DIFF{drift diff}
   DIFF -->|new / regressed| ALERT[Slack + SNS/SES]
   DIFF -->|resolved| ALERT
   AUD --> LOG[(audit-log table)]
+  AUD --> SUM[(summary<br/>aggregate)]
   AUD -. failures .-> DLQ[(SQS DLQ)]
   DLQ --> CWALARM[CloudWatch alarm]
 
@@ -47,16 +48,21 @@ flowchart LR
   CF --> COG[Cognito hosted UI]
   CF --> API[API Lambda]
   API --> DDB
+  API --> SUM
   API -. /audit/trigger .-> AUD
 ```
 
-**One audit cycle, in order.** The Lambda wakes any snoozed findings whose timer has expired and flips them back to open. It snapshots the set of currently-active findings. It runs every rule against freshly-fetched cloud state. It upserts each result with conditional writes (so a scheduled run and a manual trigger can't corrupt each other). It diffs the results against the pre-run snapshot to label findings as newly-appeared versus resolved. Finally it alerts only on the new ones and posts a count of the resolved ones.
+**One audit cycle, in order.** The Lambda wakes any snoozed findings whose timer has expired and flips them back to open. It snapshots the set of currently-active findings. It runs every rule against freshly-fetched cloud state. It upserts each result with conditional writes (so a scheduled run and a manual trigger can't corrupt each other). It diffs the results against the pre-run snapshot to label findings as newly-appeared versus resolved. Finally it alerts only on the new ones and posts a count of the resolved ones, and reconciles the summary aggregate if it has gone stale.
 
 ## Design decisions and tradeoffs
 
 **Idempotent, atomic writes.** Problem: the hourly schedule and a manual `/audit/trigger` can run concurrently, and a read-then-write upsert would let them clobber each other's occurrence counts or double-alert. Decision: a three-phase conditional write. Phase 1 attempts a create gated on `attribute_not_exists(pk)`. Phase 2 (on a hit) does a status-gated update that bumps `last_seen`/`occurrence_count`. Phase 3 only overwrites when the existing item is `RESOLVED`, which is the regression case. Tradeoff: three round trips in the worst case instead of one, in exchange for correctness under concurrency with no locks.
 
 **Sparse, write-sharded active index.** Problem: queries like "all open findings" shouldn't scan the table, but a GSI keyed on a status with ~3 values creates a hot partition where every open item lands on one key. Decision: the `active-pk-index` carries the key `STATUS#shard`, where `shard = crc32(pk) % N` (default 10), and the key is dropped entirely on resolve/exempt. So the index is both sparse (resolved history never bloats it) and spread across N partitions per status. Tradeoff: reads fan out across the shards and merge, and N is fixed at deploy (changing it needs a re-shard), in exchange for removing the single-partition write ceiling.
+
+**Maintained summary aggregate.** Problem: the dashboard's headline counts (`GET /summary`) were a full table scan on every page load, so cost and latency grew with finding history. Decision: a single item in a small summary table holds flat counters (`total`, `status#OPEN`, `sev#HIGH`, `team#infra#OPEN`), and every lifecycle transition applies an atomic `ADD` delta to it, so the endpoint is one `GetItem`. Counters can drift, for example when TTL deletes an old resolved finding. So the auditor rebuilds the aggregate from a scan once it is older than `SUMMARY_REBUILD_HOURS` (default 24). Counter writes are best-effort, so a failed bump can never fail the lifecycle change it describes. Tradeoff: counts can be briefly off, bounded by the rebuild interval, in exchange for summary reads that don't grow with the table.
+
+**Exact cursor pagination.** Problem: `GET /violations` capped at 500 with no way to fetch the rest, and the sharded active index makes a plain `LastEvaluatedKey` insufficient. Decision: an opaque cursor that records the shard and the resume key within it. Each DynamoDB call asks only for the number of items still needed, so the resume key is exact and nothing is read and then silently dropped. Tradeoff: a filtered page can take a few round trips to fill, because DynamoDB applies `Limit` before filters.
 
 **Alert de-noising.** Problem: a CSPM that re-alerts every finding every hour trains people to ignore it. Decision: alerts fire only on findings that are net-new relative to the pre-run snapshot. Tradeoff: the alert path depends on the persisted store being correct, which is why the write path above is conditional rather than best-effort.
 
@@ -88,6 +94,16 @@ flowchart LR
 | EC2_002 | EC2 | CRITICAL | No SG allows RDP (3389) from 0.0.0.0/0 |
 | EC2_003 | EC2 | CRITICAL | No SG allows all traffic from any source |
 | EC2_004 | EC2 | MEDIUM | No SG allows HTTP (80) from 0.0.0.0/0 |
+| CT_001 | CloudTrail | CRITICAL | A logging trail covers every audited region (multi-region and org trails count) |
+| CT_002 | CloudTrail | HIGH | Trails have log file validation enabled |
+| CT_003 | CloudTrail | MEDIUM | Trail logs are encrypted with a KMS key |
+| RDS_001 | RDS | CRITICAL | Instance is not publicly accessible |
+| RDS_002 | RDS | HIGH | Storage encryption at rest is enabled |
+| RDS_003 | RDS | MEDIUM | Automated backups retained for at least 7 days (configurable) |
+| KMS_001 | KMS | MEDIUM | Customer-managed symmetric keys have automatic rotation enabled |
+| EBS_001 | EBS | HIGH | Volumes are encrypted |
+| EBS_002 | EBS | MEDIUM | Region-level EBS encryption by default is enabled |
+| EBS_003 | EBS | CRITICAL | Snapshots are not shared publicly |
 
 Rules are declared in `policies.yaml`. Adding one is two steps: add the YAML entry (id, name, severity, `check`), then implement that `check` handler in the relevant auditor. The auditors follow a small strategy interface (`fetch_resources` + `evaluate`), so a new service is a new class, not a change to the engine.
 
@@ -152,18 +168,18 @@ CI/CD: every push and PR runs lint, type-check, and the test suite. The deploy j
 
 ```bash
 pip install -r requirements-dev.txt
-make test         # 104 tests, Moto-backed (no real AWS)
+make test         # 150 tests, Moto-backed (no real AWS)
 make lint         # ruff
 make type-check   # mypy
 
-python scripts/local_run.py   # simulate a full audit cycle against mocked AWS
+python scripts/local_run.py   # simulate a full audit cycle (all 7 services) against mocked AWS
 
 cd dashboard && npm install && npm run dev   # http://localhost:5173
 ```
 
 The dashboard runs against an in-memory mock API by default, so no backend is needed to explore it. Auth is a no-op when the Cognito environment variables are unset, so the SPA loads straight to the dashboard locally.
 
-The suite is part of the trust story, not an afterthought. It covers the violation lifecycle (including the regression and exempted-survives-reaudit edge cases), the JWT verification branches (valid id/access tokens, expired, wrong client, wrong issuer, key rotation), the Secrets Manager loader and its env fallback, write-sharding behavior, and the multi-account evaluator including assume-role failure isolation.
+The suite is part of the trust story, not an afterthought. It covers the violation lifecycle (including the regression and exempted-survives-reaudit edge cases), the JWT verification branches (valid id/access tokens, expired, wrong client, wrong issuer, key rotation), the Secrets Manager loader and its env fallback, write-sharding behavior, the multi-account evaluator including assume-role failure isolation, every auditor's pass and fail cases (including CloudTrail shadow-trail coverage), the summary counters through each transition and after drift, and cursor pagination across every index path.
 
 ## Configuration reference
 
@@ -173,6 +189,8 @@ Secrets come from Secrets Manager (via `SECRETS_ARN`). Everything below is non-s
 |---|---|---|
 | `VIOLATIONS_TABLE` | all | DynamoDB violation store |
 | `AUDIT_LOG_TABLE` | all | Append-only lifecycle trail |
+| `SUMMARY_TABLE` | all | Maintained `/summary` aggregate |
+| `SUMMARY_REBUILD_HOURS` | auditor | Max age before the auditor reconciles the aggregate (default 24) |
 | `SECRETS_ARN` | all | Secrets Manager secret to read at cold start |
 | `SNS_TOPIC_ARN` | all | Alert + alarm fan-out topic |
 | `DASHBOARD_URL` | all | CloudFront URL (Slack deep links, CORS allow-list) |
@@ -186,18 +204,18 @@ Secrets come from Secrets Manager (via `SECRETS_ARN`). Everything below is non-s
 
 ```
 src/
-  auditors/       strategy base + s3/ec2/iam auditors (fetch_resources + evaluate)
+  auditors/       strategy base + s3/ec2/iam/cloudtrail/rds/kms/ebs auditors
   engine/         evaluator.py: multi-account/region fan-out
-  store/          violations.py (lifecycle + sharded writes), audit_log.py (trail)
+  store/          violations.py (lifecycle, sharded writes, summary counters, cursors), audit_log.py
   config/         secrets.py: Secrets Manager loader, cold-start cached
   notifications/  slack.py (Block Kit) + digest.py (weekly SES)
   api/            handler.py: API Gateway Lambda (Cognito JWT + API key)
   handler.py      scheduled auditor entrypoint
 dashboard/        React 18 + Vite + TypeScript + Tailwind + Recharts
   src/hooks/      useAuth.ts: Cognito PKCE flow, in-memory tokens
-tests/            104 tests (Moto-backed)
+tests/            150 tests (Moto-backed)
 policies.yaml             declarative rule set
-template.yaml             SAM IaC (DynamoDB, Lambda, API GW, CloudFront, Cognito, SQS, Secrets)
+template.yaml             SAM IaC (DynamoDB x3, Lambda, API GW, CloudFront, Cognito, SQS, Secrets)
 member-account-role.yaml  read-only role for each scanned account
 ```
 
@@ -207,20 +225,22 @@ Every endpoint accepts `X-Api-Key: <key>` or `Authorization: Bearer <cognito-jwt
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/violations` | List, filters: `?status=&severity=&team=` |
+| GET | `/violations` | One page, filters: `?status=&severity=&team=&limit=&cursor=`. Returns `next_cursor` (null on the last page) |
 | GET | `/violations/{id}` | One violation by `violation_id` |
 | GET | `/violations/{id}/history` | Lifecycle trail, newest first |
 | PATCH | `/violations/{id}` | `{"action": "acknowledge"\|"snooze"\|"exempt"}` |
-| GET | `/summary` | Aggregate counts by status, severity, team |
+| GET | `/summary` | Aggregate counts by status, severity, team (read from the maintained aggregate) |
 | POST | `/audit/trigger` | Queue an out-of-cycle run (async, 202) |
 | POST | `/slack/interact` | Slack button callback (signature-verified) |
 
 ## Known limitations and roadmap
 
 - The active index shards writes across a fixed N partitions per status. That raises the ceiling a long way past a single-partition design, but at extreme concurrent-active volume you would raise N (a re-shard) or move to a per-status counter table.
-- `get_summary` scans the table. Fine for thousands of findings; at much larger scale it should read from a maintained aggregate rather than scanning.
-- Coverage is S3, EC2, and IAM today. CloudTrail, RDS, KMS, and EBS rules are natural next additions, and the auditor strategy interface is built so each is an additive change.
-- The dashboard list is not paginated in the UI; the API caps a page at 500.
+- Summary counts are maintained incrementally and reconciled every `SUMMARY_REBUILD_HOURS`. The reconcile is still a full scan, just once a day rather than once per page load. A lifecycle change that lands during a rebuild can be missed until the next one.
+- Listing with no status filter, or with `RESOLVED`/`EXEMPTED`, pages through a filtered scan rather than an index.
+- KMS findings are attributed to a team through the key's `team` tag. CloudTrail and account-level findings show as `untagged`.
+- The Posture trend chart still uses sample data; there is no historical-trend endpoint yet.
+- Natural next rules: GuardDuty enabled, VPC flow logs, Lambda public URLs, ELB TLS policies. Each is an additive auditor.
 
 ## License
 

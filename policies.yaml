@@ -87,3 +87,68 @@ rules:
       check: unrestricted_ingress
       port: 80
       description: "Security group should not expose HTTP (port 80) directly from 0.0.0.0/0"
+
+  cloudtrail:
+    - id: CT_001
+      name: "CloudTrail Not Enabled"
+      severity: CRITICAL
+      check: cloudtrail_not_enabled
+      description: "Every audited region must be covered by a CloudTrail trail that is actively logging"
+
+    - id: CT_002
+      name: "CloudTrail Log File Validation Disabled"
+      severity: HIGH
+      check: log_file_validation_disabled
+      description: "Trails must enable log file validation so tampering with delivered logs is detectable"
+
+    - id: CT_003
+      name: "CloudTrail Logs Not KMS Encrypted"
+      severity: MEDIUM
+      check: trail_not_kms_encrypted
+      description: "Trail logs should be encrypted at rest with a customer-managed KMS key"
+
+  rds:
+    - id: RDS_001
+      name: "RDS Instance Publicly Accessible"
+      severity: CRITICAL
+      check: rds_publicly_accessible
+      description: "RDS instances must not be publicly accessible from the internet"
+
+    - id: RDS_002
+      name: "RDS Storage Encryption Required"
+      severity: HIGH
+      check: rds_storage_unencrypted
+      description: "RDS instances must have storage encryption at rest enabled"
+
+    - id: RDS_003
+      name: "RDS Backup Retention Too Short"
+      severity: MEDIUM
+      check: rds_backup_retention_low
+      min_days: 7
+      description: "RDS automated backups must be retained for at least 7 days"
+
+  kms:
+    - id: KMS_001
+      name: "KMS Key Rotation Disabled"
+      severity: MEDIUM
+      check: kms_rotation_disabled
+      description: "Customer-managed symmetric KMS keys must have automatic rotation enabled"
+
+  ebs:
+    - id: EBS_001
+      name: "EBS Volume Not Encrypted"
+      severity: HIGH
+      check: ebs_volume_unencrypted
+      description: "EBS volumes must be encrypted at rest"
+
+    - id: EBS_002
+      name: "EBS Encryption By Default Disabled"
+      severity: MEDIUM
+      check: ebs_default_encryption_disabled
+      description: "The region's EBS encryption-by-default setting must be enabled so new volumes are encrypted"
+
+    - id: EBS_003
+      name: "EBS Snapshot Is Public"
+      severity: CRITICAL
+      check: ebs_snapshot_public
+      description: "EBS snapshots must not be shared publicly (createVolumePermission group 'all')"

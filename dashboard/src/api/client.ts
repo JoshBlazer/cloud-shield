@@ -1,5 +1,6 @@
 import { getAccessToken } from '../hooks/useAuth'
-import type { AuditEvent, AuditTriggerResult, Summary, Violation } from '../types'
+import { mockApi } from './mock'
+import type { AuditEvent, AuditTriggerResult, Summary, ViolationPage, ViolationQuery } from '../types'
 
 const USE_MOCK = import.meta.env.VITE_USE_MOCK !== 'false'
 const BASE     = USE_MOCK ? '' : (import.meta.env.VITE_API_URL ?? '/api')
@@ -17,12 +18,16 @@ async function req<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
-export const api = {
-  listViolations(params: { status?: string; severity?: string; team?: string } = {}) {
+const httpApi = {
+  listViolations(params: ViolationQuery = {}) {
     const qs = new URLSearchParams(
-      Object.fromEntries(Object.entries(params).filter(([, v]) => v)) as Record<string, string>
+      Object.fromEntries(
+        Object.entries(params)
+          .filter(([, v]) => v !== undefined && v !== null && v !== '')
+          .map(([k, v]) => [k, String(v)])
+      ) as Record<string, string>
     ).toString()
-    return req<{ violations: Violation[]; count: number }>(`/violations${qs ? `?${qs}` : ''}`)
+    return req<ViolationPage>(`/violations${qs ? `?${qs}` : ''}`)
   },
 
   getViolationHistory(violationId: string) {
@@ -58,3 +63,7 @@ export const api = {
     return req<AuditTriggerResult>('/audit/trigger', { method: 'POST' })
   },
 }
+
+// Every view goes through `api`: the in-memory mock by default, the real
+// API Gateway when the build sets VITE_USE_MOCK=false.
+export const api: typeof httpApi = USE_MOCK ? mockApi : httpApi

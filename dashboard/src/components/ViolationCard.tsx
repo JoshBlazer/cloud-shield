@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { mockApi } from '../api/mock'
+import { api } from '../api/client'
 import type { AuditEvent, Violation } from '../types'
 import { SeverityBadge } from './SeverityBadge'
 import { StatusBadge } from './StatusBadge'
@@ -11,6 +11,32 @@ const RESOURCE_ICON: Record<string, string> = {
   'AWS::IAM::AccessKey':      'KEY',
   'AWS::IAM::PasswordPolicy': 'PWD',
   'AWS::IAM::RootAccount':    'ROOT',
+  'AWS::CloudTrail::Trail':   'CT',
+  'AWS::RDS::DBInstance':     'RDS',
+  'AWS::KMS::Key':            'KMS',
+  'AWS::EC2::Volume':         'EBS',
+  'AWS::EC2::Snapshot':       'SNAP',
+  'AWS::::Account':           'ACCT',
+}
+
+/** Service owning each rule_id prefix; used for the tag and console link when the resource type is unknown or account-level. */
+const RULE_SERVICE: Record<string, { tag: string; home: (region: string) => string }> = {
+  S3:  { tag: 'S3',  home: () => 'https://s3.console.aws.amazon.com/s3/home' },
+  IAM: { tag: 'IAM', home: () => 'https://us-east-1.console.aws.amazon.com/iamv2/home' },
+  EC2: { tag: 'EC2', home: (r) => `https://${r}.console.aws.amazon.com/ec2/home?region=${r}` },
+  CT:  { tag: 'CT',  home: (r) => `https://${r}.console.aws.amazon.com/cloudtrailv2/home?region=${r}#/trails` },
+  RDS: { tag: 'RDS', home: (r) => `https://${r}.console.aws.amazon.com/rds/home?region=${r}#databases:` },
+  KMS: { tag: 'KMS', home: (r) => `https://${r}.console.aws.amazon.com/kms/home?region=${r}#/kms/keys` },
+  EBS: { tag: 'EBS', home: (r) => `https://${r}.console.aws.amazon.com/ec2/home?region=${r}#Volumes:` },
+}
+
+function ruleService(ruleId: string) {
+  return RULE_SERVICE[ruleId.split('_')[0]]
+}
+
+/** Last path segment of an ARN (e.g. key/1234 → 1234), or the id unchanged. */
+function shortId(id: string): string {
+  return id.startsWith('arn:') ? id.split(/[:/]/).pop() ?? id : id
 }
 
 const SEV_COLOR: Record<string, string> = {
@@ -26,6 +52,14 @@ const AWS_CONSOLE: Record<string, (id: string, region: string) => string> = {
   'AWS::IAM::User':          (id) => `https://us-east-1.console.aws.amazon.com/iamv2/home#/users/details/${id}`,
   'AWS::IAM::PasswordPolicy':() => `https://us-east-1.console.aws.amazon.com/iamv2/home#/account_settings`,
   'AWS::IAM::AccessKey':     (id) => `https://us-east-1.console.aws.amazon.com/iamv2/home#/users/details/${id.split('/')[0]}`,
+  'AWS::CloudTrail::Trail':  (id, r) => id.startsWith('arn:')
+    ? `https://${r}.console.aws.amazon.com/cloudtrailv2/home?region=${r}#/trails/${encodeURIComponent(id)}`
+    : `https://${r}.console.aws.amazon.com/cloudtrailv2/home?region=${r}#/trails`,
+  'AWS::RDS::DBInstance':    (id, r) => `https://${r}.console.aws.amazon.com/rds/home?region=${r}#database:id=${shortId(id)};is-cluster=false`,
+  'AWS::KMS::Key':           (id, r) => `https://${r}.console.aws.amazon.com/kms/home?region=${r}#/kms/keys/${shortId(id)}`,
+  'AWS::EC2::Volume':        (id, r) => `https://${r}.console.aws.amazon.com/ec2/home?region=${r}#VolumeDetails:volumeId=${shortId(id)}`,
+  'AWS::EC2::Snapshot':      (id, r) => `https://${r}.console.aws.amazon.com/ec2/home?region=${r}#SnapshotDetails:snapshotId=${shortId(id)}`,
+  // Account-level checks have no resource page; fall back to the rule's service console (see RULE_SERVICE).
 }
 
 const ACTION_ICON: Record<string, string> = {
@@ -60,8 +94,13 @@ export function ViolationCard({ violation: v, onAcknowledge, onSnooze, onExempt,
   const [history, setHistory]         = useState<AuditEvent[]>([])
   const [loadingHistory, setLoading]  = useState(false)
 
-  const tag        = RESOURCE_ICON[v.resource_type] ?? '??'
-  const consoleUrl = AWS_CONSOLE[v.resource_type]?.(v.resource_id, v.region) ?? '#'
+  const service    = ruleService(v.rule_id)
+  const tag        = RESOURCE_ICON[v.resource_type]
+    ?? service?.tag
+    ?? (v.resource_type.split('::')[1] || 'AWS').slice(0, 4).toUpperCase()
+  const consoleUrl = AWS_CONSOLE[v.resource_type]?.(v.resource_id, v.region)
+    ?? service?.home(v.region)
+    ?? `https://${v.region}.console.aws.amazon.com/console/home?region=${v.region}`
   const isOpen     = v.status === 'OPEN'
   const borderClr  = SEV_COLOR[v.severity] ?? '#f87171'
 
@@ -69,7 +108,7 @@ export function ViolationCard({ violation: v, onAcknowledge, onSnooze, onExempt,
     if (!showHistory && history.length === 0) {
       setLoading(true)
       try {
-        const data = await mockApi.getViolationHistory(v.violation_id)
+        const data = await api.getViolationHistory(v.violation_id)
         setHistory(data.events)
       } finally {
         setLoading(false)

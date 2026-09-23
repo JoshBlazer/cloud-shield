@@ -112,6 +112,25 @@ class TestListViolations:
         resp = _call("GET", "/violations")
         assert "Access-Control-Allow-Origin" in resp["headers"]
 
+    def test_last_page_has_null_cursor(self, api_session):
+        body = json.loads(_call("GET", "/violations")["body"])
+        assert body["next_cursor"] is None
+
+    def test_cursor_pages_through_results(self, api_session):
+        first = json.loads(_call("GET", "/violations", qs={"limit": "1"})["body"])
+        assert first["count"] == 1
+        assert first["next_cursor"]
+        second = json.loads(_call(
+            "GET", "/violations", qs={"limit": "1", "cursor": first["next_cursor"]},
+        )["body"])
+        ids = {first["violations"][0]["pk"], second["violations"][0]["pk"]}
+        assert ids == {"S3_001#bucket-a", "EC2_001#sg-x"}
+
+    def test_invalid_cursor_returns_400(self, api_session):
+        resp = _call("GET", "/violations", qs={"cursor": "not-a-cursor!"})
+        assert resp["statusCode"] == 400
+        assert json.loads(resp["body"])["error"] == "invalid cursor"
+
 
 class TestGetViolation:
     def test_returns_violation(self, api_session):

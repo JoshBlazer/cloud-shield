@@ -16,6 +16,7 @@ Globals:
         AWS_ACCOUNT_ID:          !Ref AWS::AccountId
         VIOLATIONS_TABLE:        !Ref ViolationsTable
         AUDIT_LOG_TABLE:         !Ref AuditLogTable
+        SUMMARY_TABLE:           !Ref SummaryTable
         DASHBOARD_URL:           !Sub "https://${DashboardDistribution.DomainName}"
         # Secrets are fetched from Secrets Manager at cold start, NOT injected here.
         SECRETS_ARN:             !Ref CloudShieldSecrets
@@ -218,6 +219,23 @@ Resources:
         - { Key: Environment, Value: !Ref Environment }
 
   # -------------------------------------------------------------------------
+  # DynamoDB — maintained /summary aggregate (one item of atomic counters,
+  # reconciled against the violations table by the auditor)
+  # -------------------------------------------------------------------------
+  SummaryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "cloudshield-summary-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+      Tags:
+        - { Key: Project, Value: CloudShield }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # -------------------------------------------------------------------------
   # IAM — shared least-privilege execution role
   # -------------------------------------------------------------------------
   AuditorExecutionRole:
@@ -253,6 +271,29 @@ Resources:
                 Action:
                   - ec2:DescribeSecurityGroups
                   - ec2:DescribeTags
+                  - ec2:GetEbsEncryptionByDefault
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeSnapshotAttribute
+                Resource: "*"
+              - Sid: CloudTrailReadAccess
+                Effect: Allow
+                Action:
+                  - cloudtrail:DescribeTrails
+                  - cloudtrail:GetTrailStatus
+                Resource: "*"
+              - Sid: RDSReadAccess
+                Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                Resource: "*"
+              - Sid: KMSReadAccess
+                Effect: Allow
+                Action:
+                  - kms:ListKeys
+                  - kms:DescribeKey
+                  - kms:GetKeyRotationStatus
+                  - kms:ListResourceTags
                 Resource: "*"
               - Sid: IAMReadAccess
                 Effect: Allow
@@ -279,6 +320,7 @@ Resources:
                   - !Sub "${ViolationsTable.Arn}/index/*"
                   - !GetAtt AuditLogTable.Arn
                   - !Sub "${AuditLogTable.Arn}/index/*"
+                  - !GetAtt SummaryTable.Arn
               - Sid: SecretsRead
                 Effect: Allow
                 Action:
